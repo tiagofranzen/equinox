@@ -1,12 +1,14 @@
 //! Self-update from GitHub Releases (github.com/visiuun/equinox).
 //!
-//! The release zip for this machine is downloaded, checked against the size
-//! and SHA-256 GitHub publishes for it, and unpacked next to the running
-//! program. Each exe is swapped by renaming: the running one becomes `.old`
-//! (Windows allows renaming a running image), the new one takes its name, and
-//! the app is started again. The `.old` files are deleted on the next start.
+//! A release carries the programs themselves: `equinox.exe` and `eqx.exe`
+//! (and `-x86` builds for 32-bit Windows). The ones for this machine are
+//! downloaded next to the running program and checked against the size and
+//! SHA-256 GitHub publishes. Each is then swapped by renaming: the running
+//! exe becomes `.old` (Windows allows renaming a running image), the new one
+//! takes its name, and the app is started again. The `.old` files are deleted
+//! on the next start.
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -16,17 +18,25 @@ use sha2::{Digest, Sha256};
 pub const RELEASES_PAGE: &str = "https://github.com/visiuun/equinox/releases";
 const API: &str = "https://api.github.com/repos/visiuun/equinox/releases/latest";
 const UA: &str = concat!("equinox/", env!("CARGO_PKG_VERSION"));
-/// The programs a release zip carries.
-const EXES: [&str; 2] = ["equinox.exe", "eqx.exe"];
+/// The app, which every release must have, then the command line.
+const APP: &str = "equinox.exe";
+const CLI: &str = "eqx.exe";
 /// Passed to the restarted app, which then waits for this one to exit.
 pub const RESTART_FLAG: &str = "--updated";
+
+/// One program to fetch: the file it replaces, and where the new one is.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Download {
+    pub file: &'static str,
+    pub url: String,
+    pub size: u64,
+    pub sha256: Option<String>,
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Release {
     pub version: String,
-    pub url: String,
-    pub size: u64,
-    pub sha256: Option<String>,
+    pub files: Vec<Download>,
 }
 
 #[derive(Deserialize)]
@@ -50,11 +60,11 @@ struct ApiAsset {
     digest: Option<String>,
 }
 
-/// The release zip built for this program's architecture.
-fn asset_name() -> Option<&'static str> {
+/// What a program is called in a release for this build's architecture.
+fn asset_name(file: &str) -> Option<String> {
     match std::env::consts::ARCH {
-        "x86_64" => Some("equinox-x64.zip"),
-        "x86" => Some("equinox-x86.zip"),
+        "x86_64" => Some(file.to_string()),
+        "x86" => Some(file.replace(".exe", "-x86.exe")),
         _ => None,
     }
 }
@@ -88,16 +98,33 @@ pub fn check() -> Result<Option<Release>, String> {
     if !is_newer(&version, &current_version()) {
         return Ok(None);
     }
-    // A release still being built has no zip for this machine yet.
-    let Some(asset) = asset_name().and_then(|want| rel.assets.into_iter().find(|a| a.name.eq_ignore_ascii_case(want))) else {
+    let files = pick(&rel.assets);
+    // A release still being built has no app for this machine yet.
+    if !files.iter().any(|f| f.file == APP) {
         return Ok(None);
-    };
-    Ok(Some(Release {
-        version,
-        url: asset.browser_download_url,
-        size: asset.size,
-        sha256: asset.digest.and_then(|d| d.strip_prefix("sha256:").map(str::to_ascii_lowercase)),
-    }))
+    }
+    Ok(Some(Release { version, files }))
+}
+
+/// The downloads in a release that belong to this build's architecture.
+fn pick(assets: &[ApiAsset]) -> Vec<Download> {
+    [APP, CLI]
+        .into_iter()
+        .filter_map(|file| {
+            let want = asset_name(file)?;
+            let a = assets.iter().find(|a| a.name.eq_ignore_ascii_case(&want))?;
+            Some(Download {
+                file,
+                url: a.browser_download_url.clone(),
+                size: a.size,
+                sha256: a
+                    .digest
+                    .as_deref()
+                    .and_then(|d| d.strip_prefix("sha256:"))
+                    .map(str::to_ascii_lowercase),
+            })
+        })
+        .collect()
 }
 
 fn new_path(exe: &Path) -> PathBuf {
@@ -108,65 +135,78 @@ fn old_path(exe: &Path) -> PathBuf {
     exe.with_extension("exe.old")
 }
 
-/// Download, verify and swap in the new programs. `progress` gets 0..1.
-/// Returns the app to start again.
-pub fn install(r: &Release, progress: impl Fn(f32)) -> Result<PathBuf, String> {
-    let app = crate::paths::app_exe();
-    let dir = app.parent().ok_or("can't tell where equinox is installed")?.to_path_buf();
-
-    let resp = ureq::get(&r.url)
+/// Fetch one program to `<target>.new` and check it. `got` is called with each chunk's size.
+fn download(d: &Download, target: &Path, got: &mut dyn FnMut(u64)) -> Result<(), String> {
+    let resp = ureq::get(&d.url)
         .set("User-Agent", UA)
         .timeout(Duration::from_secs(600))
         .call()
         .map_err(|e| format!("download failed ({e})"))?;
-    let total = resp.header("Content-Length").and_then(|v| v.parse::<u64>().ok()).unwrap_or(r.size);
     let mut body = resp.into_reader().take(256 << 20);
-    let mut zip = Vec::with_capacity(total as usize);
+    let mut file = std::fs::File::create(new_path(target)).map_err(|e| {
+        format!(
+            "can't write to {} ({e}). Move equinox to a folder you own.",
+            target.parent().unwrap_or(target).display()
+        )
+    })?;
+    let mut hash = Sha256::new();
     let mut buf = vec![0u8; 64 * 1024];
+    let (mut read, mut head) = (0u64, [0u8; 2]);
     loop {
         let n = body.read(&mut buf).map_err(|e| format!("download failed ({e})"))?;
         if n == 0 {
             break;
         }
-        zip.extend_from_slice(&buf[..n]);
-        if total > 0 {
-            progress((zip.len() as f32 / total as f32).min(1.0));
+        if read == 0 && n >= 2 {
+            head.copy_from_slice(&buf[..2]);
         }
+        file.write_all(&buf[..n]).map_err(|e| e.to_string())?;
+        hash.update(&buf[..n]);
+        read += n as u64;
+        got(n as u64);
     }
-    if r.size > 0 && zip.len() as u64 != r.size {
-        return Err("the download was incomplete".into());
+    file.sync_all().map_err(|e| e.to_string())?;
+    if d.size > 0 && read != d.size {
+        return Err(format!("the download of {} was incomplete", d.file));
     }
-    let digest: String = Sha256::digest(&zip).iter().map(|b| format!("{b:02x}")).collect();
-    if r.sha256.as_ref().is_some_and(|want| *want != digest) {
-        return Err("the download didn't match its checksum, so it was discarded".into());
+    let digest: String = hash.finalize().iter().map(|b| format!("{b:02x}")).collect();
+    if d.sha256.as_ref().is_some_and(|want| *want != digest) {
+        return Err(format!("{} didn't match its checksum, so the update was discarded", d.file));
     }
+    if &head != b"MZ" {
+        return Err(format!("{} isn't a Windows program, so the update was discarded", d.file));
+    }
+    Ok(())
+}
 
-    // Unpack everything first: nothing is replaced unless the whole zip is good.
-    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(zip)).map_err(|e| format!("the update isn't a valid zip ({e})"))?;
-    let mut staged = Vec::new();
-    for name in EXES {
-        let mut bytes = Vec::new();
-        match archive.by_name(name) {
-            Ok(mut f) => {
-                f.read_to_end(&mut bytes).map_err(|e| format!("couldn't unpack {name} ({e})"))?;
+/// Download, verify and swap in the new programs. `progress` gets 0..1.
+/// Returns the app to start again.
+pub fn install(r: &Release, progress: impl Fn(f32)) -> Result<PathBuf, String> {
+    let app = crate::paths::app_exe();
+    let targets: Vec<PathBuf> = r.files.iter().map(|d| app.with_file_name(d.file)).collect();
+    let total: u64 = r.files.iter().map(|d| d.size).sum();
+    let mut done = 0u64;
+
+    // Fetch everything first: nothing is replaced unless every download is good.
+    for (d, target) in r.files.iter().zip(&targets) {
+        let fetched = download(d, target, &mut |n| {
+            done += n;
+            if total > 0 {
+                progress((done as f32 / total as f32).min(1.0));
             }
-            // The command line is optional; the app is not.
-            Err(_) if name != EXES[0] => continue,
-            Err(e) => return Err(format!("the update has no {name} ({e})")),
+        });
+        if let Err(e) = fetched {
+            for t in &targets {
+                let _ = std::fs::remove_file(new_path(t));
+            }
+            return Err(e);
         }
-        if !bytes.starts_with(b"MZ") {
-            return Err(format!("{name} in the update isn't a Windows program, so it was discarded"));
-        }
-        let target = dir.join(name);
-        std::fs::write(new_path(&target), &bytes)
-            .map_err(|e| format!("can't write to {} ({e}). Move equinox to a folder you own.", dir.display()))?;
-        staged.push(target);
     }
 
     // The tray agent runs from the same exe and rewrites the config; stop it
     // so the restarted app brings up the new one.
     crate::sys::stop_agent();
-    for target in &staged {
+    for target in &targets {
         let (new, old) = (new_path(target), old_path(target));
         let _ = std::fs::remove_file(&old);
         if target.exists() {
@@ -192,7 +232,7 @@ pub fn relaunch(exe: &Path) -> Result<(), String> {
 /// Remove leftovers from a previous update.
 pub fn cleanup() {
     let app = crate::paths::app_exe();
-    for name in EXES {
+    for name in [APP, CLI] {
         let exe = app.with_file_name(name);
         let _ = std::fs::remove_file(old_path(&exe));
         let _ = std::fs::remove_file(new_path(&exe));
@@ -221,7 +261,7 @@ pub fn is_newer(candidate: &str, current: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::is_newer;
+    use super::*;
 
     #[test]
     fn versions() {
@@ -231,5 +271,34 @@ mod tests {
         assert!(!is_newer("0.2.0", "0.2.0"));
         assert!(!is_newer("0.2", "0.2.0"));
         assert!(!is_newer("0.1.0", "0.2.0"));
+    }
+
+    #[test]
+    fn picks_this_architectures_programs() {
+        let asset = |name: &str| ApiAsset {
+            name: name.into(),
+            browser_download_url: format!("https://example.invalid/{name}"),
+            size: 1,
+            digest: Some("sha256:ABCD".into()),
+        };
+        let assets = [
+            asset("equinox.exe"),
+            asset("eqx.exe"),
+            asset("equinox-x86.exe"),
+            asset("eqx-x86.exe"),
+        ];
+        let files = pick(&assets);
+        // Both programs, saved under their plain names whatever the release calls them.
+        assert_eq!(files.iter().map(|f| f.file).collect::<Vec<_>>(), [APP, CLI]);
+        let suffix = if cfg!(target_arch = "x86") { "-x86.exe" } else { ".exe" };
+        assert!(
+            files
+                .iter()
+                .all(|f| f.url.ends_with(suffix) && f.url.contains("x86") == cfg!(target_arch = "x86"))
+        );
+        assert_eq!(files[0].sha256.as_deref(), Some("abcd"));
+        // The command line is optional, the app is not.
+        assert_eq!(pick(&[asset("equinox.exe"), asset("equinox-x86.exe")]).len(), 1);
+        assert!(pick(&[asset("notes.txt")]).is_empty());
     }
 }

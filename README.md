@@ -93,7 +93,7 @@ Windows has no built-in equalizer that covers every app. The best audio engine f
 
 ## Install
 
-1. Download **`equinox-x64.zip`** from the [latest release](https://github.com/visiuun/equinox/releases/latest) (`equinox-x86.zip` for 32-bit Windows) and unzip it anywhere.
+1. Download **`equinox.exe`** from the [latest release](https://github.com/visiuun/equinox/releases/latest) and put it in a folder you'll keep. Want the command line too? Download **`eqx.exe`** into the same folder. (32-bit Windows: `equinox-x86.exe` and `eqx-x86.exe`.)
 2. Run **`equinox.exe`**. If SmartScreen appears, click **More info → Run anyway** (the exe isn't code-signed).
 3. Click **Install** in the banner and approve the Windows prompt. If you already use Equalizer APO, click **Set up** instead; your previous config is backed up.
 
@@ -213,7 +213,7 @@ equinox.exe / eqx.exe ──► %APPDATA%\equinox\state.json   (profiles, device
 - **Libraries:** the AutoEq index and `library/mics.json` are fetched with a conditional request at every start (an unchanged list costs one round trip). The microphone library is also built into the exe, so it works before the first download.
 - **Voice Clarity:** the selected enhancement is an endpoint property. equinox sets it to the device's own effects through the audio service (the route Windows Settings uses, so no admin rights), then switches the endpoint off and on so Windows rebuilds its effect chain.
 - **Measuring:** Windows can open a microphone "raw", skipping its effects. The check records the raw and the normal stream together and compares them band by band with the curve the config asks for.
-- **Updates:** the release zip for your architecture is downloaded, checked against the size and SHA-256 GitHub publishes, and unpacked next to the running program. The running exes are renamed aside (Windows allows that), the new ones take their names, and the app restarts.
+- **Updates:** the release's `equinox.exe` and `eqx.exe` for your architecture are downloaded next to the running program and checked against the size and SHA-256 GitHub publishes. The running exes are renamed aside (Windows allows that), the new ones take their names, and the app restarts.
 
 ## Troubleshooting
 
@@ -245,9 +245,9 @@ cargo build --release      # target\release\equinox.exe and eqx.exe
 cargo test
 ```
 
-To publish a release, bump `version` in `Cargo.toml`, tag `vX.Y.Z` and publish a GitHub release for it: the workflow attaches `equinox-x64.zip` and `equinox-x86.zip`, which is what running copies look for when they check for updates.
+To publish a release, bump `version` in `Cargo.toml`, tag `vX.Y.Z` and publish a GitHub release for it: the workflow attaches `equinox.exe` and `eqx.exe` (plus `equinox-x86.exe` and `eqx-x86.exe`), which is what running copies look for when they check for updates.
 
-You need [Rust](https://rustup.rs) and the MSVC build tools (*Desktop development with C++*, or just *MSVC* and the *Windows SDK*). `rust-toolchain.toml` picks the right toolchain automatically and Cargo fetches every dependency. The C runtime is linked statically, so the exes run on a clean Windows install. Every push is built and tested by [GitHub Actions](.github/workflows/build.yml), and release zips are attached by the same workflow.
+You need [Rust](https://rustup.rs) and the MSVC build tools (*Desktop development with C++*, or just *MSVC* and the *Windows SDK*). `rust-toolchain.toml` picks the right toolchain automatically and Cargo fetches every dependency. The C runtime is linked statically, so the exes run on a clean Windows install. Every push is built and tested by [GitHub Actions](.github/workflows/build.yml), and the release exes are attached by the same workflow.
 
 ## License
 

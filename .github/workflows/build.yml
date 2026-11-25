@@ -17,10 +17,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Release assets are the programs themselves. The 64-bit ones keep
+          # their plain names; running copies look for these when updating.
           - target: x86_64-pc-windows-msvc
-            asset: equinox-x64.zip
+            app: equinox.exe
+            cli: eqx.exe
           - target: i686-pc-windows-msvc
-            asset: equinox-x86.zip
+            app: equinox-x86.exe
+            cli: eqx-x86.exe
     steps:
       - uses: actions/checkout@v5
 
@@ -38,16 +42,18 @@ jobs:
         shell: pwsh
         run: |
           $dir = "target/${{ matrix.target }}/release"
-          Compress-Archive -Path "$dir/equinox.exe", "$dir/eqx.exe" -DestinationPath "${{ matrix.asset }}"
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item "$dir/equinox.exe" "dist/${{ matrix.app }}"
+          Copy-Item "$dir/eqx.exe" "dist/${{ matrix.cli }}"
 
       - uses: actions/upload-artifact@v6
         with:
-          name: ${{ matrix.asset }}
-          path: ${{ matrix.asset }}
+          name: equinox-${{ matrix.target }}
+          path: dist/*.exe
 
       - name: Attach to release
         if: github.event_name == 'release'
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "${{ github.event.release.tag_name }}" "${{ matrix.asset }}" --clobber
+        run: gh release upload "${{ github.event.release.tag_name }}" "dist/${{ matrix.app }}" "dist/${{ matrix.cli }}" --clobber

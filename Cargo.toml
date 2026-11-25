@@ -41,7 +41,6 @@ ureq = "2"
 # Same version as `windows` uses; named here because its `interface` macro refers to the crate by name.
 windows-core = "0.62"
 winreg = "0.56"
-zip = { version = "9.7.3", default-features = false, features = ["deflate"] }
 
 [dependencies.windows]
 version = "0.62"
