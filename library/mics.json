@@ -1,0 +1,361 @@
+{
+  "version": 1,
+  "updated": "2026-11-25",
+  "about": "equinox microphone corrections. Each entry is a set of Equalizer APO filters that evens out the microphone's own voicing (presence peaks, thin low end) so your profile starts from a neutral voice. Unless an entry says otherwise it is approximated from the manufacturer's published frequency response chart, not measured in a lab: treat it as a starting point and use the strength slider. Better data is welcome as a pull request.",
+  "mics": [
+    {
+      "name": "Shure SM7B",
+      "aliases": ["sm7b", "sm 7b"],
+      "type": "Dynamic · XLR",
+      "note": "Flat switch setting. Eases the upper-mid presence and restores the top end.",
+      "filters": ["ON PK Fc 5500 Hz Gain -2.0 dB Q 1.2", "ON HSC Fc 12000 Hz Gain 2.0 dB Q 0.7"]
+    },
+    {
+      "name": "Shure SM7dB",
+      "aliases": ["sm7db", "sm 7db"],
+      "type": "Dynamic · XLR",
+      "note": "Same capsule and voicing as the SM7B, flat switch setting.",
+      "filters": ["ON PK Fc 5500 Hz Gain -2.0 dB Q 1.2", "ON HSC Fc 12000 Hz Gain 2.0 dB Q 0.7"]
+    },
+    {
+      "name": "Shure SM58",
+      "aliases": ["sm58", "sm 58"],
+      "type": "Dynamic · XLR",
+      "note": "Tames the 4-6 kHz and 10 kHz presence peaks and fills in the bass roll-off.",
+      "filters": [
+        "ON LSC Fc 110 Hz Gain 2.5 dB Q 0.7",
+        "ON PK Fc 4500 Hz Gain -3.5 dB Q 1.4",
+        "ON PK Fc 9500 Hz Gain -3.5 dB Q 2.2"
+      ]
+    },
+    {
+      "name": "Shure SM57",
+      "aliases": ["sm57", "sm 57"],
+      "type": "Dynamic · XLR",
+      "note": "Tames the strong 6 kHz presence peak and fills in the bass roll-off.",
+      "filters": ["ON LSC Fc 150 Hz Gain 3.0 dB Q 0.7", "ON PK Fc 6000 Hz Gain -4.5 dB Q 1.3"]
+    },
+    {
+      "name": "Shure Beta 58A",
+      "aliases": ["beta58a", "beta 58", "beta58"],
+      "type": "Dynamic · XLR",
+      "note": "Tames the 4 kHz and 9-10 kHz presence peaks.",
+      "filters": [
+        "ON LSC Fc 100 Hz Gain 2.0 dB Q 0.7",
+        "ON PK Fc 4200 Hz Gain -3.5 dB Q 1.5",
+        "ON PK Fc 9500 Hz Gain -4.5 dB Q 1.8"
+      ]
+    },
+    {
+      "name": "Shure MV7",
+      "aliases": ["mv7", "shure mv7", "mv7x", "mv7+", "mv7 plus"],
+      "type": "Dynamic · USB/XLR",
+      "note": "Flat EQ mode in the Shure app. Covers the MV7, MV7+ and MV7X.",
+      "filters": [
+        "ON LSC Fc 90 Hz Gain 2.0 dB Q 0.7",
+        "ON PK Fc 4500 Hz Gain -3.0 dB Q 1.0",
+        "ON PK Fc 9000 Hz Gain -2.0 dB Q 2.0"
+      ]
+    },
+    {
+      "name": "Electro-Voice RE20",
+      "aliases": ["re20", "re 20", "ev re20"],
+      "type": "Dynamic · XLR",
+      "note": "Already close to flat; only a small trim around 9 kHz.",
+      "filters": ["ON PK Fc 9000 Hz Gain -1.5 dB Q 2.0"]
+    },
+    {
+      "name": "Electro-Voice RE320",
+      "aliases": ["re320", "re 320", "ev re320"],
+      "type": "Dynamic · XLR",
+      "note": "Flat switch setting. Eases the presence rise around 5-6 kHz.",
+      "filters": ["ON PK Fc 5500 Hz Gain -4.0 dB Q 1.1"]
+    },
+    {
+      "name": "Rode PodMic",
+      "aliases": ["podmic", "pod mic", "podmic usb", "rode podmic usb"],
+      "type": "Dynamic · XLR",
+      "note": "Eases the presence bump and fills in the low end. Also fits the PodMic USB with its processing off.",
+      "filters": [
+        "ON LSC Fc 100 Hz Gain 2.0 dB Q 0.7",
+        "ON PK Fc 5500 Hz Gain -3.5 dB Q 1.3",
+        "ON PK Fc 10000 Hz Gain -2.0 dB Q 2.5"
+      ]
+    },
+    {
+      "name": "Rode Procaster",
+      "aliases": ["procaster"],
+      "type": "Dynamic · XLR",
+      "note": "Eases the 4-8 kHz presence lift.",
+      "filters": ["ON LSC Fc 90 Hz Gain 1.5 dB Q 0.7", "ON PK Fc 6000 Hz Gain -4.0 dB Q 1.2"]
+    },
+    {
+      "name": "Samson Q2U",
+      "aliases": ["q2u", "samson q2u microphone"],
+      "type": "Dynamic · USB/XLR",
+      "note": "Eases the upper presence peak and fills in the bass roll-off.",
+      "filters": ["ON LSC Fc 110 Hz Gain 3.0 dB Q 0.7", "ON PK Fc 6500 Hz Gain -4.0 dB Q 1.3"]
+    },
+    {
+      "name": "Audio-Technica ATR2100x-USB",
+      "aliases": ["atr2100x", "atr2100", "atr2100x-usb", "atr 2100"],
+      "type": "Dynamic · USB/XLR",
+      "note": "Eases the presence peak and fills in the bass roll-off.",
+      "filters": ["ON LSC Fc 110 Hz Gain 3.0 dB Q 0.7", "ON PK Fc 6000 Hz Gain -3.5 dB Q 1.3"]
+    },
+    {
+      "name": "Audio-Technica AT2040",
+      "aliases": ["at2040", "at 2040", "at2040usb"],
+      "type": "Dynamic · XLR",
+      "note": "Eases the presence lift around 5 kHz.",
+      "filters": ["ON LSC Fc 100 Hz Gain 2.0 dB Q 0.7", "ON PK Fc 5000 Hz Gain -3.0 dB Q 1.3"]
+    },
+    {
+      "name": "Sennheiser e 835",
+      "aliases": ["e835", "e 835"],
+      "type": "Dynamic · XLR",
+      "note": "Tames the 4-5 kHz and 10 kHz presence peaks.",
+      "filters": [
+        "ON LSC Fc 100 Hz Gain 2.0 dB Q 0.7",
+        "ON PK Fc 4500 Hz Gain -3.0 dB Q 1.5",
+        "ON PK Fc 10000 Hz Gain -3.0 dB Q 2.0"
+      ]
+    },
+    {
+      "name": "Sennheiser MD 421-II",
+      "aliases": ["md421", "md 421", "md421ii"],
+      "type": "Dynamic · XLR",
+      "note": "Bass switch at M (music). Eases the 5 kHz presence peak.",
+      "filters": ["ON PK Fc 5000 Hz Gain -4.0 dB Q 1.2"]
+    },
+    {
+      "name": "Heil PR 40",
+      "aliases": ["pr40", "pr 40", "heil pr40"],
+      "type": "Dynamic · XLR",
+      "note": "Eases the mid-range presence rise around 4-5 kHz.",
+      "filters": ["ON PK Fc 4500 Hz Gain -3.5 dB Q 1.3"]
+    },
+    {
+      "name": "Behringer XM8500",
+      "aliases": ["xm8500", "xm 8500"],
+      "type": "Dynamic · XLR",
+      "note": "Tames the presence peaks and fills in the bass roll-off.",
+      "filters": [
+        "ON LSC Fc 110 Hz Gain 2.0 dB Q 0.7",
+        "ON PK Fc 5000 Hz Gain -4.0 dB Q 1.4",
+        "ON PK Fc 10000 Hz Gain -3.0 dB Q 2.2"
+      ]
+    },
+    {
+      "name": "Audio-Technica AT2020",
+      "aliases": ["at2020", "at 2020", "at2020usb", "at2020usb+", "at2020usb-x", "at2020usbx", "at2020 usb"],
+      "type": "Condenser · XLR / USB",
+      "note": "Eases the 5-9 kHz lift and the 13 kHz peak. Covers the USB versions.",
+      "filters": ["ON PK Fc 7000 Hz Gain -2.5 dB Q 1.4", "ON PK Fc 13000 Hz Gain -2.5 dB Q 2.0"]
+    },
+    {
+      "name": "Audio-Technica AT2035",
+      "aliases": ["at2035", "at 2035"],
+      "type": "Condenser · XLR",
+      "note": "Eases the upper-treble peak around 12 kHz.",
+      "filters": ["ON PK Fc 4500 Hz Gain -1.5 dB Q 1.5", "ON PK Fc 12000 Hz Gain -3.0 dB Q 1.6"]
+    },
+    {
+      "name": "Audio-Technica AT4040",
+      "aliases": ["at4040", "at 4040"],
+      "type": "Condenser · XLR",
+      "note": "Small trims at 6-7 kHz and 12 kHz.",
+      "filters": ["ON PK Fc 6500 Hz Gain -2.0 dB Q 1.5", "ON PK Fc 12000 Hz Gain -2.0 dB Q 2.0"]
+    },
+    {
+      "name": "Rode NT1-A",
+      "aliases": ["nt1a", "nt1-a", "nt1 a"],
+      "type": "Condenser · XLR",
+      "note": "Tames the bright top end around 12 kHz.",
+      "filters": ["ON PK Fc 3800 Hz Gain -1.5 dB Q 1.6", "ON PK Fc 12000 Hz Gain -4.0 dB Q 1.4"]
+    },
+    {
+      "name": "Rode NT1 (4th / 5th generation)",
+      "aliases": ["nt1", "nt1 5th", "nt1 5th generation", "rode nt1 5th generation", "nt1 signature"],
+      "type": "Condenser · XLR / USB",
+      "note": "Already close to flat; only a small trim around 5-6 kHz.",
+      "filters": ["ON PK Fc 5500 Hz Gain -1.0 dB Q 1.4"]
+    },
+    {
+      "name": "Rode NT-USB",
+      "aliases": ["ntusb", "nt-usb", "nt usb", "rode nt-usb", "nt-usb+", "ntusb+"],
+      "type": "Condenser · USB",
+      "note": "Eases the bright 5-8 kHz presence. Also fits the NT-USB+.",
+      "filters": ["ON PK Fc 6500 Hz Gain -3.5 dB Q 1.2", "ON HSC Fc 12000 Hz Gain -1.5 dB Q 0.7"]
+    },
+    {
+      "name": "Rode NT-USB Mini",
+      "aliases": ["ntusb mini", "nt-usb mini", "nt usb mini", "rode nt-usb mini"],
+      "type": "Condenser · USB",
+      "note": "Eases the presence lift and adds a little low end.",
+      "filters": ["ON LSC Fc 100 Hz Gain 1.5 dB Q 0.7", "ON PK Fc 7000 Hz Gain -3.0 dB Q 1.4"]
+    },
+    {
+      "name": "Blue Yeti",
+      "aliases": ["yeti", "yeti stereo microphone", "blue yeti", "logitech yeti"],
+      "type": "Condenser · USB",
+      "note": "Cardioid pattern. Fills the dip near 3 kHz and eases the 7-10 kHz lift.",
+      "filters": ["ON PK Fc 3000 Hz Gain 1.5 dB Q 1.5", "ON PK Fc 8500 Hz Gain -3.0 dB Q 1.2"]
+    },
+    {
+      "name": "Blue Yeti X",
+      "aliases": ["yeti x", "yetix"],
+      "type": "Condenser · USB",
+      "note": "Cardioid pattern. Eases the treble lift around 8 kHz.",
+      "filters": ["ON PK Fc 8000 Hz Gain -3.0 dB Q 1.3"]
+    },
+    {
+      "name": "Blue Yeti Nano",
+      "aliases": ["yeti nano", "yetinano"],
+      "type": "Condenser · USB",
+      "note": "Cardioid pattern. Eases the treble lift around 7-8 kHz.",
+      "filters": ["ON PK Fc 7500 Hz Gain -3.0 dB Q 1.3"]
+    },
+    {
+      "name": "Blue Snowball",
+      "aliases": ["snowball", "blue snowball", "snowball ice", "blue snowball ice"],
+      "type": "Condenser · USB",
+      "note": "Cardioid pattern. Eases the 9 kHz peak and adds a little low end. Also fits the Snowball iCE.",
+      "filters": ["ON LSC Fc 100 Hz Gain 1.5 dB Q 0.7", "ON PK Fc 9000 Hz Gain -3.5 dB Q 1.2"]
+    },
+    {
+      "name": "HyperX QuadCast",
+      "aliases": ["quadcast", "hyperx quadcast", "quadcast s", "hyperx quadcast s", "quadcast 2"],
+      "type": "Condenser · USB",
+      "note": "Cardioid pattern. Eases the treble peak around 8-9 kHz. Also fits the QuadCast S.",
+      "filters": ["ON LSC Fc 100 Hz Gain 1.5 dB Q 0.7", "ON PK Fc 8500 Hz Gain -4.0 dB Q 1.3"]
+    },
+    {
+      "name": "HyperX SoloCast",
+      "aliases": ["solocast", "hyperx solocast"],
+      "type": "Condenser · USB",
+      "note": "Eases the treble peak around 8-9 kHz and fills in the thin low end.",
+      "filters": ["ON LSC Fc 110 Hz Gain 2.0 dB Q 0.7", "ON PK Fc 8500 Hz Gain -3.5 dB Q 1.3"]
+    },
+    {
+      "name": "Elgato Wave:3",
+      "aliases": ["wave3", "wave 3", "wave:3", "elgato wave", "wave:1", "wave1", "wave 1"],
+      "type": "Condenser · USB",
+      "note": "Small trim of the 5-8 kHz lift. Also fits the Wave:1.",
+      "filters": ["ON PK Fc 6500 Hz Gain -2.0 dB Q 1.3"]
+    },
+    {
+      "name": "Razer Seiren Mini",
+      "aliases": ["seiren mini", "razer seiren mini", "seirenmini"],
+      "type": "Condenser · USB",
+      "note": "Eases the bright top end and fills in the low end.",
+      "filters": ["ON LSC Fc 100 Hz Gain 2.0 dB Q 0.7", "ON PK Fc 9000 Hz Gain -3.5 dB Q 1.3"]
+    },
+    {
+      "name": "Razer Seiren X",
+      "aliases": ["seiren x", "razer seiren x", "seirenx"],
+      "type": "Condenser · USB",
+      "note": "Eases the treble lift around 8 kHz.",
+      "filters": ["ON LSC Fc 100 Hz Gain 1.5 dB Q 0.7", "ON PK Fc 8000 Hz Gain -3.0 dB Q 1.3"]
+    },
+    {
+      "name": "AKG P120",
+      "aliases": ["p120", "akg p120", "perception 120"],
+      "type": "Condenser · XLR",
+      "note": "Eases the bright treble around 10 kHz.",
+      "filters": ["ON PK Fc 10000 Hz Gain -3.0 dB Q 1.3"]
+    },
+    {
+      "name": "AKG P220",
+      "aliases": ["p220", "akg p220", "perception 220"],
+      "type": "Condenser · XLR",
+      "note": "Eases the treble lift around 9 kHz.",
+      "filters": ["ON PK Fc 9000 Hz Gain -2.5 dB Q 1.3"]
+    },
+    {
+      "name": "AKG C214",
+      "aliases": ["c214", "akg c214"],
+      "type": "Condenser · XLR",
+      "note": "Eases the presence lift that peaks around 12-13 kHz.",
+      "filters": ["ON PK Fc 12000 Hz Gain -3.5 dB Q 1.2"]
+    },
+    {
+      "name": "Neumann TLM 102",
+      "aliases": ["tlm102", "tlm 102"],
+      "type": "Condenser · XLR",
+      "note": "Eases the presence boost above 6 kHz.",
+      "filters": ["ON PK Fc 9000 Hz Gain -3.0 dB Q 0.9"]
+    },
+    {
+      "name": "Neumann TLM 103",
+      "aliases": ["tlm103", "tlm 103"],
+      "type": "Condenser · XLR",
+      "note": "Eases the broad 4 dB presence boost between 6 and 15 kHz.",
+      "filters": ["ON PK Fc 8000 Hz Gain -3.5 dB Q 0.8"]
+    },
+    {
+      "name": "Neumann U 87 Ai",
+      "aliases": ["u87", "u 87", "u87ai", "u87 ai"],
+      "type": "Condenser · XLR",
+      "note": "Cardioid pattern. Small trim around 9-10 kHz.",
+      "filters": ["ON PK Fc 9500 Hz Gain -2.0 dB Q 1.2"]
+    },
+    {
+      "name": "Sennheiser MKH 416",
+      "aliases": ["mkh416", "mkh 416", "416"],
+      "type": "Shotgun condenser · XLR",
+      "note": "Eases the treble rise around 8-10 kHz.",
+      "filters": ["ON PK Fc 9000 Hz Gain -3.0 dB Q 1.2"]
+    },
+    {
+      "name": "Lewitt LCT 440 PURE",
+      "aliases": ["lct440", "lct 440", "lct 440 pure", "lct440pure"],
+      "type": "Condenser · XLR",
+      "note": "Eases the upper-mid bump and the 11 kHz air lift.",
+      "filters": ["ON PK Fc 3500 Hz Gain -1.5 dB Q 1.5", "ON PK Fc 11000 Hz Gain -3.5 dB Q 1.2"]
+    },
+    {
+      "name": "Generic headset boom mic",
+      "aliases": ["headset", "headset mic", "gaming headset", "boom mic"],
+      "type": "Generic starting point",
+      "generic": true,
+      "note": "Typical for headset microphones: thin lows, nasal mids, dull top. Not specific to one model.",
+      "filters": [
+        "ON HPQ Fc 80 Hz Q 0.707",
+        "ON LSC Fc 160 Hz Gain 4.0 dB Q 0.7",
+        "ON PK Fc 1200 Hz Gain -2.5 dB Q 1.2",
+        "ON PK Fc 3000 Hz Gain -2.0 dB Q 1.5",
+        "ON HSC Fc 8000 Hz Gain 2.5 dB Q 0.7"
+      ]
+    },
+    {
+      "name": "Generic laptop or webcam mic",
+      "aliases": ["laptop", "webcam", "built-in", "builtin", "microphone array"],
+      "type": "Generic starting point",
+      "generic": true,
+      "note": "Typical for small built-in microphones: boxy low mids and a harsh upper-mid peak. Not specific to one model.",
+      "filters": [
+        "ON HPQ Fc 100 Hz Q 0.707",
+        "ON LSC Fc 180 Hz Gain 3.0 dB Q 0.7",
+        "ON PK Fc 450 Hz Gain -2.5 dB Q 1.2",
+        "ON PK Fc 3500 Hz Gain -3.0 dB Q 1.4"
+      ]
+    },
+    {
+      "name": "Generic bright USB condenser",
+      "aliases": ["usb condenser", "condenser", "usb mic", "usb microphone"],
+      "type": "Generic starting point",
+      "generic": true,
+      "note": "Typical for budget USB condensers: a treble peak near 8-10 kHz and light bass. Not specific to one model.",
+      "filters": ["ON LSC Fc 100 Hz Gain 1.5 dB Q 0.7", "ON PK Fc 9000 Hz Gain -3.5 dB Q 1.3"]
+    },
+    {
+      "name": "Generic dynamic vocal mic",
+      "aliases": ["dynamic", "vocal mic", "handheld"],
+      "type": "Generic starting point",
+      "generic": true,
+      "note": "Typical for handheld stage microphones: a presence peak near 5 kHz and rolled-off bass. Not specific to one model.",
+      "filters": ["ON LSC Fc 110 Hz Gain 2.5 dB Q 0.7", "ON PK Fc 5000 Hz Gain -3.5 dB Q 1.4"]
+    }
+  ]
+}

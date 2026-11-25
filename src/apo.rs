@@ -20,6 +20,16 @@ pub struct Apo {
 }
 
 pub fn detect() -> Option<Apo> {
+    // `EQUINOX_APO_CONFIG` points a test copy at a scratch folder, so it can't
+    // touch the config the audio engine is really using.
+    if let Some(dir) = std::env::var_os("EQUINOX_APO_CONFIG") {
+        let dir = PathBuf::from(dir);
+        return dir.is_dir().then(|| Apo {
+            install: dir.clone(),
+            config: dir,
+            version: "test".into(),
+        });
+    }
     let key = RegKey::predef(HKEY_LOCAL_MACHINE)
         .open_subkey_with_flags(r"SOFTWARE\EqualizerAPO", KEY_READ)
         .ok()?;

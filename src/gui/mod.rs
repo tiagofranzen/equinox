@@ -11,40 +11,91 @@ pub mod theme;
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::mpsc::{Receiver, channel};
+use std::sync::mpsc::{Receiver, TryRecvError, channel};
 use std::time::{Duration, Instant, SystemTime};
 
 use eframe::egui::{self, Color32, RichText, Sense, Stroke, pos2, vec2};
-use equinox::analyzer::Analyzer;
+use equinox::analyzer::{Analyzer, Source};
 use equinox::apo::{self, Apo};
 use equinox::autoeq::{self, Entry};
 use equinox::devices::{self, AudioDevice};
 use equinox::engine;
+use equinox::miclib::{self, Library, Mic};
 use equinox::model::{Correction, Mode, State, Target};
+use equinox::monitor::Monitor;
 use equinox::sys;
+use equinox::update::{self, Release};
 
 use theme::*;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Page {
     Eq,
+    /// The same editor, pointed at a microphone.
+    Mic,
     Automation,
     Settings,
 }
 
-/// AutoEq browser state; the index loads in the background at startup.
+/// AutoEq browser state. At startup the saved index is shown at once and the
+/// current one replaces it as soon as the server answers.
 #[derive(Default)]
 pub struct AutoEqUi {
     pub open: bool,
     pub query: String,
     pub index: Option<Arc<Vec<Entry>>>,
     pub index_rx: Option<Receiver<Result<Vec<Entry>, String>>>,
+    /// Asking the server whether the index changed.
+    pub checking: bool,
     pub fetch_rx: Option<Receiver<(Target, Result<Correction, String>)>>,
     pub fetching: Option<String>,
     pub error: Option<String>,
     pub focus: bool,
     /// Device id -> recognised headphone model.
     pub suggestions: HashMap<String, Entry>,
+}
+
+/// Where the self-update is.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub enum UpdateState {
+    #[default]
+    Idle,
+    Checking,
+    UpToDate,
+    Available(Release),
+    Downloading(Release, f32),
+    Failed(String),
+}
+
+enum UpdateMsg {
+    /// The answer, and whether the user asked (so failures are worth showing).
+    Checked(Result<Option<Release>, String>, bool),
+    Progress(f32),
+    Installed(Result<std::path::PathBuf, String>),
+}
+
+/// Result of "check it works" for one microphone.
+#[derive(Clone, Debug)]
+pub struct MicVerdict {
+    pub mic: String,
+    /// `Ok(None)`: the EQ is too close to flat to measure.
+    pub result: Result<Option<bool>, String>,
+}
+
+/// Microphone library browser. The list is small, so it is always in memory:
+/// the saved or built-in copy first, the current one once it has downloaded.
+#[derive(Default)]
+pub struct MicLibUi {
+    pub open: bool,
+    pub query: String,
+    pub lib: Arc<Library>,
+    pub rx: Option<Receiver<Result<Option<Library>, String>>>,
+    pub checking: bool,
+    /// The last check failed (offline): the list shown may not be the newest.
+    pub offline: bool,
+    pub focus: bool,
+    /// Microphone id -> recognised model.
+    pub suggestions: HashMap<String, Mic>,
 }
 
 pub struct App {
@@ -60,6 +111,30 @@ pub struct App {
     last_poll: Instant,
     last_devices: Instant,
     pub devices: Vec<AudioDevice>,
+    /// Input devices, for the Microphone page.
+    pub mics: Vec<AudioDevice>,
+    /// The microphone the Microphone page shows.
+    pub mic_sel: Option<String>,
+    /// Where the Equalizer page was, to come back to from the Microphone page.
+    out_target: Target,
+    pub mlib: MicLibUi,
+    /// "Hear yourself" playback, while it's on.
+    pub monitor: Option<Monitor>,
+    /// Smoothed microphone level for the meter next to the monitor button.
+    pub mic_level: f32,
+    pub update: UpdateState,
+    update_rx: Option<Receiver<UpdateMsg>>,
+    /// The update banner was dismissed for this run.
+    pub update_snoozed: bool,
+    /// Microphones where a Windows effect pack is running instead of the EQ.
+    pub enh_blocked: Vec<String>,
+    /// Ones already switched this run, so a setting that won't stick isn't fought over.
+    enh_tried: std::collections::HashSet<String>,
+    enh_rx: Option<Receiver<(String, Result<bool, String>)>>,
+    mic_check_rx: Option<Receiver<MicVerdict>>,
+    /// The microphone being measured, while "check it works" listens.
+    pub mic_checking: Option<String>,
+    pub mic_verdict: Option<MicVerdict>,
     pub apo: Option<Apo>,
     pub hooked: bool,
     pub foreign: Vec<String>,
@@ -88,8 +163,16 @@ pub struct App {
     pub picker: devices_ui::Picker,
 }
 
-pub fn run(page: Option<&str>) {
-    let Some(_guard) = sys::single_instance(sys::APP_MUTEX) else {
+/// `after_update`: started by the updater while the old window is still
+/// closing, so wait for it instead of handing over to it.
+pub fn run(page: Option<&str>, after_update: bool) {
+    let mut guard = sys::single_instance(sys::APP_MUTEX);
+    let waited = Instant::now();
+    while guard.is_none() && after_update && waited.elapsed() < Duration::from_secs(15) {
+        std::thread::sleep(Duration::from_millis(100));
+        guard = sys::single_instance(sys::APP_MUTEX);
+    }
+    let Some(_guard) = guard else {
         sys::focus_app_window();
         return;
     };
@@ -110,6 +193,7 @@ pub fn run(page: Option<&str>) {
     };
     let open_devices = page == Some("devices");
     let page = match page {
+        Some("mic" | "microphone") => Page::Mic,
         Some("automation") => Page::Automation,
         Some("settings") => Page::Settings,
         _ => Page::Eq,
@@ -138,6 +222,24 @@ impl App {
         let devices = devices::list();
         let target = initial_target(&st, &devices);
         let mut app = App {
+            mics: devices::list_capture(),
+            mic_sel: None,
+            out_target: target.clone(),
+            mlib: MicLibUi {
+                lib: Arc::new(miclib::cached()),
+                ..Default::default()
+            },
+            monitor: None,
+            mic_level: 0.0,
+            update: UpdateState::Idle,
+            update_rx: None,
+            update_snoozed: false,
+            enh_blocked: Vec::new(),
+            enh_tried: Default::default(),
+            enh_rx: None,
+            mic_check_rx: None,
+            mic_checking: None,
+            mic_verdict: None,
             applied: st.clone(),
             committed: st.clone(),
             undo: Vec::new(),
@@ -178,7 +280,10 @@ impl App {
         };
         app.refresh_apo();
         app.push();
-        app.load_index(ctx, false);
+        // Both libraries are re-checked on every start.
+        app.load_index(ctx);
+        app.load_miclib(ctx);
+        app.compute_suggestions();
         if first_run {
             // Starting with Windows is the default; Settings turns it off.
             match sys::set_autostart(true) {
@@ -193,11 +298,149 @@ impl App {
             app.committed = app.st.clone();
             let _ = app.st.save();
             app.file_mtime = mtime();
+        } else if app.autostart && std::env::var_os("EQUINOX_HOME").is_none() {
+            // A newer build than the installed copy: update it, so the tray
+            // agent that starts with Windows writes the same config as this app.
+            if let Err(e) = sys::refresh_install() {
+                app.notify(format!("couldn't update the installed copy: {e}"), true);
+            }
         }
         if app.st.settings.agent {
             sys::start_agent();
         }
+        update::cleanup();
+        // Not for development builds, nor for test copies unless they rehearse an update.
+        let test_copy = std::env::var_os("EQUINOX_HOME").is_some() && std::env::var_os("EQUINOX_VERSION").is_none();
+        if app.st.settings.auto_update && !cfg!(debug_assertions) && !test_copy {
+            app.check_update(ctx, false);
+        }
+        app.repair_microphones(ctx);
         app
+    }
+
+    /// Ask GitHub whether there is a newer release.
+    pub fn check_update(&mut self, ctx: &egui::Context, manual: bool) {
+        if matches!(self.update, UpdateState::Checking | UpdateState::Downloading(..)) {
+            return;
+        }
+        self.update = UpdateState::Checking;
+        let (tx, rx) = channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(UpdateMsg::Checked(update::check(), manual));
+            ctx.request_repaint();
+        });
+        self.update_rx = Some(rx);
+    }
+
+    /// Download the release that was found, swap it in and restart.
+    pub fn install_update(&mut self, ctx: &egui::Context) {
+        let UpdateState::Available(r) = self.update.clone() else { return };
+        self.update = UpdateState::Downloading(r.clone(), 0.0);
+        let (tx, rx) = channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let progress = tx.clone();
+            let ui = ctx.clone();
+            let result = update::install(&r, move |p| {
+                let _ = progress.send(UpdateMsg::Progress(p));
+                ui.request_repaint();
+            });
+            let _ = tx.send(UpdateMsg::Installed(result));
+            ctx.request_repaint();
+        });
+        self.update_rx = Some(rx);
+    }
+
+    fn poll_update(&mut self, ctx: &egui::Context) {
+        while let Some(rx) = &self.update_rx {
+            let Ok(msg) = rx.try_recv() else { break };
+            match msg {
+                UpdateMsg::Checked(r, manual) => {
+                    self.update_rx = None;
+                    self.update = match r {
+                        Ok(Some(rel)) => {
+                            self.update_snoozed = false;
+                            UpdateState::Available(rel)
+                        }
+                        Ok(None) => UpdateState::UpToDate,
+                        Err(e) if manual => UpdateState::Failed(e),
+                        // A failed check at startup (offline) isn't worth a message.
+                        Err(_) => UpdateState::Idle,
+                    };
+                }
+                UpdateMsg::Progress(p) => {
+                    if let UpdateState::Downloading(_, progress) = &mut self.update {
+                        *progress = p;
+                    }
+                }
+                UpdateMsg::Installed(r) => {
+                    self.update_rx = None;
+                    match r.and_then(|exe| update::relaunch(&exe)) {
+                        Ok(()) => {
+                            // Save now; the new copy takes over as this window closes.
+                            let _ = self.st.save();
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                        Err(e) => {
+                            self.notify(format!("Update failed: {e}"), true);
+                            self.update = UpdateState::Failed(e);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Find microphones whose EQ Windows has replaced with one of its own
+    /// effects (Voice Clarity) and, unless that is switched off in Settings,
+    /// put each back on its own effects once.
+    pub fn repair_microphones(&mut self, ctx: &egui::Context) {
+        let blocked: Vec<(String, String)> = self
+            .mics
+            .iter()
+            .filter(|d| d.active && d.apo && equinox::enhance::overridden(&d.id, true))
+            .map(|d| (d.id.clone(), d.label()))
+            .collect();
+        self.enh_blocked = blocked.iter().map(|b| b.0.clone()).collect();
+        if !self.st.settings.fix_enhancements || self.enh_rx.is_some() {
+            return;
+        }
+        let todo: Vec<(String, String)> = blocked.into_iter().filter(|b| self.enh_tried.insert(b.0.clone())).collect();
+        if !todo.is_empty() {
+            self.run_repair(ctx, todo);
+        }
+    }
+
+    /// Switch these microphones (id, name) to their own effects, off the UI thread:
+    /// the device is restarted, which takes about a second.
+    pub fn run_repair(&mut self, ctx: &egui::Context, mics: Vec<(String, String)>) {
+        let (tx, rx) = channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            for (id, name) in mics {
+                let _ = tx.send((name, equinox::enhance::fix(&id, true)));
+            }
+            ctx.request_repaint();
+        });
+        self.enh_rx = Some(rx);
+    }
+
+    /// Measure whether the EQ reaches `mic` (three seconds of listening).
+    pub fn check_microphone(&mut self, ctx: &egui::Context, mic: String) {
+        if self.mic_check_rx.is_some() {
+            return;
+        }
+        let (tx, rx) = channel();
+        let (ctx, state) = (ctx.clone(), self.st.clone());
+        self.mic_checking = Some(mic.clone());
+        self.mic_verdict = None;
+        std::thread::spawn(move || {
+            let result = equinox::miccheck::run_for(&state, &mic, 3.0).map(|c| c.applied());
+            let _ = tx.send(MicVerdict { mic, result });
+            ctx.request_repaint();
+        });
+        self.mic_check_rx = Some(rx);
     }
 
     pub fn refresh_apo(&mut self) {
@@ -229,14 +472,48 @@ impl App {
         theme::style(ctx, self.accent);
     }
 
-    pub fn load_index(&mut self, ctx: &egui::Context, refresh: bool) {
+    /// Show the saved AutoEq index right away, then ask the server for the current one.
+    pub fn load_index(&mut self, ctx: &egui::Context) {
         let (tx, rx) = channel();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            let _ = tx.send(autoeq::load_index(refresh).map_err(|e| format!("{e:#}")));
+            let saved = autoeq::cached_index();
+            let had = saved.is_some();
+            if let Some(v) = saved {
+                let _ = tx.send(Ok(v));
+                ctx.request_repaint();
+            }
+            match autoeq::refresh_index() {
+                Ok(Some(v)) => {
+                    let _ = tx.send(Ok(v));
+                }
+                // Unchanged, but the saved copy was unreadable: fetch it whole.
+                Ok(None) if !had => {
+                    let _ = tx.send(autoeq::load_index(Duration::ZERO).map_err(|e| format!("{e:#}")));
+                }
+                Ok(None) => {}
+                // Offline with a saved index is fine; without one there is nothing to show.
+                Err(e) if !had => {
+                    let _ = tx.send(Err(format!("{e:#}")));
+                }
+                Err(_) => {}
+            }
             ctx.request_repaint();
         });
         self.aeq.index_rx = Some(rx);
+        self.aeq.checking = true;
+    }
+
+    /// Ask the repository for a newer microphone library.
+    pub fn load_miclib(&mut self, ctx: &egui::Context) {
+        let (tx, rx) = channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(miclib::refresh().map_err(|e| format!("{e:#}")));
+            ctx.request_repaint();
+        });
+        self.mlib.rx = Some(rx);
+        self.mlib.checking = true;
     }
 
     /// Download a correction off-thread and apply it to `target` when it lands.
@@ -253,6 +530,11 @@ impl App {
     }
 
     fn compute_suggestions(&mut self) {
+        self.mlib.suggestions = self
+            .mics
+            .iter()
+            .filter_map(|d| miclib::suggest(&self.mlib.lib, &d.label()).map(|m| (d.id.clone(), m.clone())))
+            .collect();
         let Some(idx) = &self.aeq.index else { return };
         self.aeq.suggestions = self
             .devices
@@ -263,16 +545,55 @@ impl App {
     }
 
     fn poll_jobs(&mut self) {
-        if let Some(rx) = &self.aeq.index_rx
-            && let Ok(r) = rx.try_recv()
-        {
-            self.aeq.index_rx = None;
-            match r {
-                Ok(v) => {
+        // The index arrives up to twice: the saved copy, then the current one.
+        while let Some(rx) = &self.aeq.index_rx {
+            match rx.try_recv() {
+                Ok(Ok(v)) => {
                     self.aeq.index = Some(Arc::new(v));
+                    self.aeq.error = None;
                     self.compute_suggestions();
                 }
-                Err(e) => self.aeq.error = Some(e),
+                Ok(Err(e)) => self.aeq.error = Some(e),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    self.aeq.index_rx = None;
+                    self.aeq.checking = false;
+                }
+            }
+        }
+        while let Some(rx) = &self.enh_rx {
+            match rx.try_recv() {
+                Ok((name, Ok(true))) => self.notify(
+                    format!("Turned off Windows Voice Clarity on {name}: it was running instead of the EQ"),
+                    false,
+                ),
+                Ok((_, Ok(false))) => {}
+                Ok((name, Err(e))) => self.notify(format!("{name}: {e}"), true),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    self.enh_rx = None;
+                    // The repair restarted the device; look at everything afresh.
+                    self.mics = devices::list_capture();
+                    self.enh_blocked.retain(|id| equinox::enhance::overridden(id, true));
+                }
+            }
+        }
+        if let Some(rx) = &self.mic_check_rx
+            && let Ok(v) = rx.try_recv()
+        {
+            self.mic_check_rx = None;
+            self.mic_checking = None;
+            self.mic_verdict = Some(v);
+        }
+        if let Some(rx) = &self.mlib.rx
+            && let Ok(r) = rx.try_recv()
+        {
+            self.mlib.rx = None;
+            self.mlib.checking = false;
+            self.mlib.offline = r.is_err();
+            if let Ok(Some(lib)) = r {
+                self.mlib.lib = Arc::new(lib);
+                self.compute_suggestions();
             }
         }
         if let Some(rx) = &self.aeq.fetch_rx
@@ -284,7 +605,7 @@ impl App {
                 Ok(c) => {
                     let name = c.name.clone();
                     self.st.chain_mut(&target).correction = Some(c);
-                    self.st.bypass = false;
+                    self.set_bypass(&target, false);
                     self.aeq.open = false;
                     self.notify(format!("{name} correction applied"), false);
                 }
@@ -350,15 +671,27 @@ impl App {
         // Devices, rule context and agent status every 2 s.
         if now.duration_since(self.last_devices) > Duration::from_secs(2) {
             self.last_devices = now;
-            let fresh = devices::list();
-            let changed = fresh.len() != self.devices.len()
-                || fresh
-                    .iter()
-                    .zip(&self.devices)
-                    .any(|(a, b)| a.id != b.id || a.active != b.active || a.default != b.default || a.apo != b.apo);
+            let differs = |a: &[AudioDevice], b: &[AudioDevice]| {
+                a.len() != b.len()
+                    || a.iter()
+                        .zip(b)
+                        .any(|(a, b)| a.id != b.id || a.active != b.active || a.default != b.default || a.apo != b.apo)
+            };
+            let (fresh, fresh_mics) = (devices::list(), devices::list_capture());
+            let changed = differs(&fresh, &self.devices) || differs(&fresh_mics, &self.mics);
             self.devices = fresh;
+            self.mics = fresh_mics;
             if changed {
                 self.compute_suggestions();
+            }
+            self.repair_microphones(ctx);
+            // Keep the saved names of set-up microphones current (they label the config).
+            for m in &mut self.st.mics {
+                if let Some(d) = self.mics.iter().find(|d| d.id == m.id)
+                    && m.name != d.label()
+                {
+                    m.name = d.label();
+                }
             }
             self.rule_ctx = engine::Context::capture(&self.st, &self.devices);
             self.refresh_apo();
@@ -373,12 +706,37 @@ impl App {
             self.toast = None;
         }
 
-        // Analyzer runs only while visible and enabled.
-        let want = self.st.settings.analyzer && self.page == Page::Eq && ctx.input(|i| i.focused || i.viewport().minimized != Some(true));
-        if want && self.analyzer.is_none() {
-            self.analyzer = Some(Analyzer::start());
-        } else if !want && self.analyzer.is_some() {
-            self.analyzer = None;
+        // "Hear yourself" follows the Microphone page and the selected microphone.
+        let listen_to = match (&self.page, &self.target) {
+            (Page::Mic, Target::Mic(id)) => Some(id.clone()),
+            _ => None,
+        };
+        if let Some(m) = &self.monitor {
+            match &listen_to {
+                Some(id) if m.mic() == id => {
+                    m.set_volume(self.st.settings.monitor_volume);
+                    let peak = m.take_peak();
+                    self.mic_level = if peak > self.mic_level { peak } else { self.mic_level * 0.85 };
+                    ctx.request_repaint_after(Duration::from_millis(33));
+                }
+                Some(id) => self.monitor = Some(Monitor::start(id, self.st.settings.monitor_volume)),
+                None => self.monitor = None,
+            }
+        } else {
+            self.mic_level = 0.0;
+        }
+
+        // Analyzer runs only while visible and enabled: what's playing on the
+        // Equalizer page, the selected microphone on the Microphone page.
+        let source = match (&self.page, &self.target) {
+            (Page::Eq, _) => Some(Source::Output),
+            (Page::Mic, Target::Mic(id)) => Some(Source::Mic(id.clone())),
+            _ => None,
+        };
+        let visible = ctx.input(|i| i.focused || i.viewport().minimized != Some(true));
+        let want = source.filter(|_| self.st.settings.analyzer && visible);
+        if self.analyzer.as_ref().map(|a| a.source()) != want.as_ref() {
+            self.analyzer = want.map(Analyzer::start);
             self.spectrum.clear();
         }
         if let Some(a) = &mut self.analyzer {
@@ -433,19 +791,81 @@ impl App {
         }
     }
 
+    /// An output or a microphone by endpoint id.
     pub fn device(&self, id: &str) -> Option<&AudioDevice> {
-        self.devices.iter().find(|d| d.id == id)
+        self.devices.iter().chain(&self.mics).find(|d| d.id == id)
+    }
+
+    /// Outputs, then microphones.
+    pub fn all_devices(&self) -> impl Iterator<Item = &AudioDevice> {
+        self.devices.iter().chain(&self.mics)
     }
 
     pub fn target_name(&self, t: &Target) -> String {
         match t {
             Target::Global if self.st.mode == Mode::Global => "All devices".into(),
             Target::Global => "Default".into(),
-            Target::Device(id) => self
+            Target::Device(id) | Target::Mic(id) => self
                 .device(id)
                 .map(|d| d.label())
-                .or_else(|| self.st.device(id).map(|d| d.name.clone()))
+                .or_else(|| {
+                    self.st
+                        .device(id)
+                        .or(self.st.mic(id))
+                        .map(|d| d.name.clone())
+                        .filter(|n| !n.is_empty())
+                })
                 .unwrap_or_else(|| "Unknown device".into()),
+        }
+    }
+
+    /// Outputs and microphones bypass separately.
+    pub fn set_bypass(&mut self, target: &Target, on: bool) {
+        if target.is_mic() {
+            self.st.mic_bypass = on;
+        } else {
+            self.st.bypass = on;
+        }
+    }
+
+    /// Point the editor at what the current page is about: the Microphone
+    /// page edits the selected microphone, every other page an output.
+    fn sync_target(&mut self) {
+        if self.page != Page::Mic {
+            if self.target.is_mic() {
+                self.target = self.out_target.clone();
+                self.sel_band = None;
+            } else {
+                self.out_target = self.target.clone();
+            }
+            return;
+        }
+        let known = self
+            .mic_sel
+            .as_deref()
+            .is_some_and(|id| self.mics.iter().any(|d| d.id == id) || self.st.mic(id).is_some());
+        if !known {
+            self.mic_sel = self
+                .mics
+                .iter()
+                .find(|d| d.default && d.active)
+                .or(self.mics.iter().find(|d| d.active))
+                .or(self.mics.first())
+                .map(|d| d.id.clone())
+                .or_else(|| self.st.mics.first().map(|m| m.id.clone()));
+        }
+        match self.mic_sel.clone().map(Target::Mic) {
+            Some(t) if self.target != t => {
+                if !self.target.is_mic() {
+                    self.out_target = self.target.clone();
+                }
+                self.target = t;
+                self.sel_band = None;
+            }
+            Some(_) => {}
+            // No microphone at all: the page shows a note instead of an editor.
+            None if self.target.is_mic() => self.target = self.out_target.clone(),
+            None => {}
         }
     }
 
@@ -471,6 +891,7 @@ impl App {
                 ui.add_space(22.0);
                 for (p, label) in [
                     (Page::Eq, "Equalizer"),
+                    (Page::Mic, "Microphone"),
                     (Page::Automation, "Automation"),
                     (Page::Settings, "Settings"),
                 ] {
@@ -520,9 +941,15 @@ impl App {
     }
 
     /// The big on/bypass pill. Bypass is level-matched by default for honest A/B.
+    /// On the Microphone page it switches the microphone EQ instead.
     fn power_button(&mut self, ui: &mut egui::Ui) {
-        let on = !self.st.bypass;
-        let text = if on { "EQ ON" } else { "BYPASSED" };
+        let mic = self.page == Page::Mic;
+        let on = !(if mic { self.st.mic_bypass } else { self.st.bypass });
+        let text = match (mic, on) {
+            (false, true) => "EQ ON",
+            (true, true) => "MIC EQ ON",
+            (_, false) => "BYPASSED",
+        };
         let galley = ui
             .painter()
             .layout_no_wrap(text.into(), egui::FontId::new(12.5, semibold()), Color32::BLACK);
@@ -547,8 +974,21 @@ impl App {
             egui::FontId::new(12.5, semibold()),
             if on { Color32::BLACK } else { TEXT },
         );
-        let resp = resp.on_hover_text("Bypass the EQ (Ctrl+B). Level-matched, so the comparison is fair.");
+        let resp = resp.on_hover_text(if mic {
+            "Bypass the microphone EQ (Ctrl+B). Outputs have their own switch on the Equalizer page."
+        } else {
+            "Bypass the EQ (Ctrl+B). Level-matched, so the comparison is fair."
+        });
         if resp.clicked() {
+            self.toggle_bypass();
+        }
+    }
+
+    /// Flip the bypass of whatever the current page edits.
+    fn toggle_bypass(&mut self) {
+        if self.page == Page::Mic {
+            self.st.mic_bypass = !self.st.mic_bypass;
+        } else {
             self.st.bypass = !self.st.bypass;
         }
     }
@@ -560,7 +1000,7 @@ impl App {
                 (None, _) => (BAD, "Equalizer APO not installed".to_string()),
                 (Some(a), false) => (WARN, format!("Equalizer APO {} · not loading equinox", a.version)),
                 (Some(a), true) => {
-                    let n = self.devices.iter().filter(|d| d.active && d.apo).count();
+                    let n = self.all_devices().filter(|d| d.active && d.apo).count();
                     (
                         if n > 0 { GOOD } else { WARN },
                         format!("Equalizer APO {} · {n} device{} active", a.version, if n == 1 { "" } else { "s" }),
@@ -615,9 +1055,9 @@ impl App {
             self.redo();
         }
         if bypass {
-            self.st.bypass = !self.st.bypass;
+            self.toggle_bypass();
         }
-        if del && self.page == Page::Eq {
+        if del && matches!(self.page, Page::Eq | Page::Mic) {
             self.delete_selected_band();
         }
     }
@@ -689,7 +1129,9 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.poll_jobs();
+        self.poll_update(&ctx);
         self.poll_picker();
+        self.sync_target();
         self.tick(&ctx);
         self.shortcuts(&ctx);
 
@@ -715,13 +1157,14 @@ impl eframe::App for App {
                 .show(ui, |ui| {
                     ui.set_min_size(ui.available_size());
                     match self.page {
-                        Page::Eq => self.eq_page(ui),
+                        Page::Eq | Page::Mic => self.eq_page(ui),
                         Page::Automation => self.automation_page(ui),
                         Page::Settings => self.settings_page(ui),
                     }
                 });
         });
         self.autoeq_modal(&ctx);
+        self.miclib_modal(&ctx);
         self.picker_modal(&ctx);
         self.resize_edges(ui);
         ui.painter()

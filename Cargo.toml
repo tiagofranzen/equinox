@@ -1,9 +1,9 @@
 [package]
 name = "equinox"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.88"
-description = "System-wide parametric EQ for Windows: per-device profiles, AutoEq headphone correction, automation and a CLI"
+description = "System-wide parametric EQ for Windows: per-device profiles, AutoEq headphone correction, microphone EQ, automation and a CLI"
 license = "CC-BY-NC-4.0"
 repository = "https://github.com/visiuun/equinox"
 readme = "README.md"
@@ -38,7 +38,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tray-icon = "0.26"
 ureq = "2"
+# Same version as `windows` uses; named here because its `interface` macro refers to the crate by name.
+windows-core = "0.62"
 winreg = "0.56"
+zip = { version = "9.7.3", default-features = false, features = ["deflate"] }
 
 [dependencies.windows]
 version = "0.62"

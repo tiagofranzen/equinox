@@ -1,15 +1,19 @@
 //! The AutoEq database: ~9k headphone measurements turned into EQ by
-//! jaakkopasanen/AutoEq. The index and each profile are fetched once and cached.
+//! jaakkopasanen/AutoEq. The index is re-checked every time the app starts and
+//! each profile when it is applied; the copies on disk are for working offline.
 
 use std::path::PathBuf;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Result, bail};
 
+use crate::fetch;
 use crate::model::Correction;
 
 const RAW: &str = "https://raw.githubusercontent.com/jaakkopasanen/AutoEq/master/results/";
-const INDEX_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 3600);
+/// How long the command line trusts the index before checking again (the app
+/// always checks at startup).
+pub const CLI_MAX_AGE: Duration = Duration::from_secs(3600);
 
 #[derive(Clone, Debug)]
 pub struct Entry {
@@ -48,7 +52,7 @@ fn source_rank(source: &str) -> i32 {
     }
 }
 
-fn normalize(s: &str) -> String {
+pub(crate) fn normalize(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut space = true;
     for c in s.chars().flat_map(char::to_lowercase) {
@@ -96,45 +100,32 @@ fn index_cache() -> PathBuf {
     crate::paths::cache_dir().join("autoeq-index.md")
 }
 
-fn get(url: &str) -> Result<String> {
-    let resp = ureq::get(url)
-        .timeout(Duration::from_secs(20))
-        .call()
-        .with_context(|| format!("GET {url}"))?;
-    Ok(resp.into_string()?)
+fn index_url() -> String {
+    format!("{RAW}INDEX.md")
 }
 
-/// The index, from cache when fresh (or when offline), otherwise downloaded.
-pub fn load_index(refresh: bool) -> Result<Vec<Entry>> {
-    let cache = index_cache();
-    let age = std::fs::metadata(&cache)
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| SystemTime::now().duration_since(t).ok());
-    if !refresh
-        && age.is_some_and(|a| a < INDEX_MAX_AGE)
-        && let Ok(md) = std::fs::read_to_string(&cache)
-    {
-        return Ok(parse_index(&md));
-    }
-    match get(&format!("{RAW}INDEX.md")) {
-        Ok(md) => {
-            let _ = std::fs::create_dir_all(cache.parent().unwrap());
-            let _ = std::fs::write(&cache, &md);
-            Ok(parse_index(&md))
-        }
-        Err(e) => match std::fs::read_to_string(&cache) {
-            Ok(md) => Ok(parse_index(&md)),
-            Err(_) => Err(e.context("couldn't download the AutoEq index")),
-        },
-    }
+/// The index as last downloaded, without touching the network.
+pub fn cached_index() -> Option<Vec<Entry>> {
+    let v = parse_index(&std::fs::read_to_string(index_cache()).ok()?);
+    (!v.is_empty()).then_some(v)
 }
 
+/// Check the server for a newer index. `Ok(None)`: the cached one is current.
+pub fn refresh_index() -> Result<Option<Vec<Entry>>> {
+    let fresh = fetch::refresh(&index_url(), &index_cache()).map_err(|e| e.context("couldn't download the AutoEq index"))?;
+    Ok(fresh.map(|md| parse_index(&md)))
+}
+
+/// The index: checked against the server unless it was confirmed within
+/// `max_age` (pass zero to always check), and the cached copy when offline.
+pub fn load_index(max_age: Duration) -> Result<Vec<Entry>> {
+    let md = fetch::text(&index_url(), &index_cache(), max_age).map_err(|e| e.context("couldn't download the AutoEq index"))?;
+    Ok(parse_index(&md))
+}
+
+/// How long ago the index was last confirmed current.
 pub fn index_age() -> Option<Duration> {
-    std::fs::metadata(index_cache())
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| SystemTime::now().duration_since(t).ok())
+    fetch::age(&index_cache())
 }
 
 /// Fuzzy search: every query word must match (spaces and dashes optional,
@@ -284,20 +275,11 @@ fn profile_cache(e: &Entry) -> PathBuf {
     crate::paths::cache_dir().join("autoeq").join(format!("{safe}.txt"))
 }
 
-/// Download (or read cached) ParametricEQ.txt for an entry.
+/// The current ParametricEQ.txt for an entry (the saved copy when offline).
 pub fn fetch(e: &Entry) -> Result<Correction> {
-    let cache = profile_cache(e);
-    let text = match std::fs::read_to_string(&cache) {
-        Ok(t) => t,
-        Err(_) => {
-            let folder = pct_decode(e.path.rsplit('/').next().unwrap_or(&e.name));
-            let url = format!("{RAW}{}/{}", e.path, pct_encode(&format!("{folder} ParametricEQ.txt")));
-            let t = get(&url)?;
-            let _ = std::fs::create_dir_all(cache.parent().unwrap());
-            let _ = std::fs::write(&cache, &t);
-            t
-        }
-    };
+    let folder = pct_decode(e.path.rsplit('/').next().unwrap_or(&e.name));
+    let url = format!("{RAW}{}/{}", e.path, pct_encode(&format!("{folder} ParametricEQ.txt")));
+    let text = fetch::text(&url, &profile_cache(e), Duration::ZERO)?;
     let parsed = crate::eqtext::parse(&text);
     if parsed.bands.is_empty() {
         bail!("no filters in the AutoEq profile for {}", e.name);

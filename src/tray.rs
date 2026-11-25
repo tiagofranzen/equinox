@@ -38,6 +38,10 @@ struct Agent {
     quit: MenuItem,
     hotkeys: bool,
     last_bypass: Option<bool>,
+    ticks: u32,
+    /// Microphones whose Windows enhancement was already switched once this
+    /// run, so a setting that won't stick isn't fought over.
+    repaired: std::collections::HashSet<String>,
 }
 
 pub fn run() {
@@ -143,6 +147,8 @@ impl Agent {
             quit,
             hotkeys: false,
             last_bypass: None,
+            ticks: 0,
+            repaired: Default::default(),
             st,
         };
         a.sync_ui();
@@ -179,8 +185,23 @@ impl Agent {
         let ctx = engine::Context::capture(&self.st, &self.devices);
         // Only writes when rules, devices or state changed the rendered text.
         engine::apply(&self.st, &self.devices, &ctx);
+        self.ticks = self.ticks.wrapping_add(1);
+        if self.ticks % 15 == 1 && self.st.settings.fix_enhancements {
+            self.repair_microphones();
+        }
         self.sync_ui();
         true
+    }
+
+    /// Windows can put Voice Clarity back on a microphone (after an update, or
+    /// for a newly plugged one), which silently replaces the EQ. Switch any
+    /// EQ'd microphone back to its own effects.
+    fn repair_microphones(&mut self) {
+        for d in devices::list_capture() {
+            if d.active && d.apo && equinox::enhance::overridden(&d.id, true) && self.repaired.insert(d.id.clone()) {
+                let _ = equinox::enhance::fix(&d.id, true);
+            }
+        }
     }
 
     fn sync_ui(&mut self) {
@@ -212,7 +233,8 @@ impl Agent {
         self.enabled.set_checked(!self.st.bypass);
         self.startup.set_checked(sys::autostart_enabled());
 
-        let sig: Vec<(u64, String)> = self.st.profiles.iter().map(|p| (p.id, p.name.clone())).collect();
+        // Output profiles only: the tray and hotkeys act on what's playing.
+        let sig: Vec<(u64, String)> = self.st.profiles_for(false).map(|p| (p.id, p.name.clone())).collect();
         if sig != self.profile_sig {
             for (_, _, item) in self.profile_items.drain(..) {
                 let _ = self.profiles.remove(&item);
@@ -262,17 +284,18 @@ impl Agent {
     fn hotkey(&mut self, id: i32) {
         match id {
             HK_TOGGLE => self.st.bypass = !self.st.bypass,
-            HK_NEXT | HK_PREV if !self.st.profiles.is_empty() => {
+            HK_NEXT | HK_PREV if self.st.profiles_for(false).next().is_some() => {
                 let t = self.target();
-                let n = self.st.profiles.len();
+                let ids: Vec<u64> = self.st.profiles_for(false).map(|p| p.id).collect();
+                let n = ids.len();
                 let cur = self
                     .st
                     .chain(&t)
                     .profile
-                    .and_then(|pid| self.st.profiles.iter().position(|p| p.id == pid))
+                    .and_then(|pid| ids.iter().position(|&p| p == pid))
                     .unwrap_or(0);
                 let next = if id == HK_NEXT { (cur + 1) % n } else { (cur + n - 1) % n };
-                let pid = self.st.profiles[next].id;
+                let pid = ids[next];
                 self.st.chain_mut(&t).profile = Some(pid);
                 self.st.bypass = false;
             }

@@ -4,7 +4,7 @@
 use std::collections::HashSet;
 
 use windows::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE};
-use windows::Win32::Media::Audio::{IMMDeviceEnumerator, MMDeviceEnumerator, eConsole, eRender};
+use windows::Win32::Media::Audio::{EDataFlow, IMMDeviceEnumerator, MMDeviceEnumerator, eCapture, eConsole, eRender};
 use windows::Win32::System::Com::{CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree};
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
@@ -29,10 +29,24 @@ pub fn com_init() {
 
 /// GUID of the default render endpoint ("{...}", lowercase).
 pub fn default_output() -> Option<String> {
+    default_endpoint(eRender)
+}
+
+/// GUID of the default capture endpoint (the microphone apps get).
+pub fn default_input() -> Option<String> {
+    default_endpoint(eCapture)
+}
+
+/// The id WASAPI knows an endpoint by, from its GUID.
+pub fn endpoint_id(guid: &str, capture: bool) -> String {
+    format!("{{0.0.{}.00000000}}.{guid}", if capture { 1 } else { 0 })
+}
+
+fn default_endpoint(flow: EDataFlow) -> Option<String> {
     com_init();
     unsafe {
         let en: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).ok()?;
-        let dev = en.GetDefaultAudioEndpoint(eRender, eConsole).ok()?;
+        let dev = en.GetDefaultAudioEndpoint(flow, eConsole).ok()?;
         let id = dev.GetId().ok()?;
         let s = id.to_string().ok();
         CoTaskMemFree(Some(id.0 as _));
@@ -230,6 +244,27 @@ fn install() -> std::io::Result<std::path::PathBuf> {
         }
     }
     Ok(dst)
+}
+
+/// Bring the installed copy (the one that starts with Windows) up to this
+/// build when they differ, restarting the tray agent if it had to be stopped.
+pub fn refresh_install() -> std::io::Result<()> {
+    let src = crate::paths::app_exe();
+    let dst = install_dir().join("equinox.exe");
+    if !dst.exists() || same_file(&src, &dst) || same_bytes(&src, &dst) {
+        return Ok(());
+    }
+    let was_running = agent_running();
+    install()?;
+    if was_running {
+        start_agent();
+    }
+    Ok(())
+}
+
+fn same_bytes(a: &std::path::Path, b: &std::path::Path) -> bool {
+    let len = |p: &std::path::Path| std::fs::metadata(p).map(|m| m.len()).ok();
+    len(a).is_some() && len(a) == len(b) && matches!((std::fs::read(a), std::fs::read(b)), (Ok(x), Ok(y)) if x == y)
 }
 
 fn same_file(a: &std::path::Path, b: &std::path::Path) -> bool {

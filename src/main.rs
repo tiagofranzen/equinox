@@ -9,8 +9,10 @@ fn main() {
         Some("--tray") => tray::run(),
         // Elevated helper that installs Equalizer APO on devices (see apo_setup).
         Some("--apo-setup") => equinox::apo_setup::elevated_main(&args[1..]),
-        // `--page automation|settings|devices` opens on that page (devices: the output picker).
-        Some("--page") => gui::run(args.get(1).map(String::as_str)),
-        _ => gui::run(None),
+        // `--page mic|automation|settings|devices` opens on that page (devices: the picker).
+        Some("--page") => gui::run(args.get(1).map(String::as_str), false),
+        // Started by the updater: the old window is still closing.
+        Some(equinox::update::RESTART_FLAG) => gui::run(None, true),
+        _ => gui::run(None, false),
     }
 }

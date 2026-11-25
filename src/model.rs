@@ -1,8 +1,9 @@
 //! Everything equinox persists, in one serde tree (`state.json`).
 //!
-//! Profiles are a shared library of sounds. A chain is what one output gets:
-//! a profile, an optional headphone correction, preamp and balance. The global
-//! chain covers every device; in per-device mode each device can have its own.
+//! Profiles are a shared library of sounds. A chain is what one device gets:
+//! a profile, an optional measured correction, preamp and balance. The global
+//! chain covers every output; in per-device mode each output can have its own.
+//! Microphones always have a chain each, and their own set of profiles.
 
 use std::path::Path;
 
@@ -162,6 +163,9 @@ pub struct Profile {
     pub tone: Tone,
     #[serde(default)]
     pub bands: Vec<Band>,
+    /// A microphone profile: listed for inputs instead of outputs.
+    #[serde(default)]
+    pub mic: bool,
 }
 
 impl Profile {
@@ -173,7 +177,8 @@ impl Profile {
     }
 }
 
-/// A measured headphone correction (AutoEq or imported). Applied before the profile.
+/// A correction for a headphone (AutoEq) or a microphone (the mic library),
+/// or an imported one. Applied before the profile.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Correction {
     pub name: String,
@@ -233,16 +238,21 @@ pub struct Chain {
     pub balance: f32,
 }
 
+impl Chain {
+    /// No profile, no correction: what a microphone has until it is touched.
+    pub const FLAT: Chain = Chain {
+        profile: None,
+        correction: None,
+        strength: 1.0,
+        auto_preamp: true,
+        preamp: 0.0,
+        balance: 0.0,
+    };
+}
+
 impl Default for Chain {
     fn default() -> Self {
-        Chain {
-            profile: None,
-            correction: None,
-            strength: 1.0,
-            auto_preamp: true,
-            preamp: 0.0,
-            balance: 0.0,
-        }
+        Chain::FLAT
     }
 }
 
@@ -273,6 +283,15 @@ pub enum Mode {
 pub enum Target {
     Global,
     Device(String),
+    /// A capture endpoint. Never stored in rules, so older builds can still
+    /// read the state file.
+    Mic(String),
+}
+
+impl Target {
+    pub fn is_mic(&self) -> bool {
+        matches!(self, Target::Mic(_))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -318,6 +337,13 @@ pub struct Settings {
     pub advanced: bool,
     /// First-launch setup (start with Windows) has run.
     pub setup_done: bool,
+    /// "Hear yourself" playback volume, 1.0 = as loud as the microphone delivers.
+    pub monitor_volume: f32,
+    /// Switch a microphone to its own effects when Windows Voice Clarity is
+    /// running in their place (which keeps Equalizer APO from loading).
+    pub fix_enhancements: bool,
+    /// Look for a newer release when the app starts.
+    pub auto_update: bool,
 }
 
 impl Default for Settings {
@@ -332,6 +358,9 @@ impl Default for Settings {
             accent: [125, 249, 255],
             advanced: false,
             setup_done: false,
+            monitor_volume: 1.0,
+            fix_enhancements: true,
+            auto_update: true,
         }
     }
 }
@@ -346,6 +375,16 @@ pub struct State {
     pub global: Chain,
     #[serde(default)]
     pub devices: Vec<DeviceEntry>,
+    /// Microphones that have been set up. Each owns its chain.
+    #[serde(default)]
+    pub mics: Vec<DeviceEntry>,
+    /// Bypass for microphones, separate from the output bypass.
+    #[serde(default)]
+    pub mic_bypass: bool,
+    /// The starter microphone profiles have been added (once, also for
+    /// state files from before microphones existed).
+    #[serde(default)]
+    pub mic_presets: bool,
     #[serde(default)]
     pub profiles: Vec<Profile>,
     #[serde(default)]
@@ -363,6 +402,9 @@ impl Default for State {
             bypass: false,
             global: Chain::default(),
             devices: Vec::new(),
+            mics: Vec::new(),
+            mic_bypass: false,
+            mic_presets: false,
             profiles: Vec::new(),
             rules: Vec::new(),
             settings: Settings::default(),
@@ -375,9 +417,11 @@ impl Default for State {
                 name: name.to_string(),
                 tone,
                 bands,
+                mic: false,
             });
         }
         s.global.profile = s.profiles.first().map(|p| p.id);
+        s.seed_mic_presets();
         s
     }
 }
@@ -405,6 +449,57 @@ impl State {
         self.profiles.iter_mut().find(|p| p.id == id)
     }
 
+    /// Add the starter microphone profiles if this state never had them.
+    pub fn seed_mic_presets(&mut self) {
+        if self.mic_presets {
+            return;
+        }
+        self.mic_presets = true;
+        for (name, tone, bands) in crate::presets::builtin_mic() {
+            let id = self.new_id();
+            let name = self.unique_name(name);
+            self.profiles.push(Profile {
+                id,
+                name,
+                tone,
+                bands,
+                mic: true,
+            });
+        }
+    }
+
+    /// Profiles for outputs (`mic == false`) or for microphones.
+    pub fn profiles_for(&self, mic: bool) -> impl Iterator<Item = &Profile> {
+        self.profiles.iter().filter(move |p| p.mic == mic)
+    }
+
+    pub fn mic(&self, id: &str) -> Option<&DeviceEntry> {
+        self.mics.iter().find(|d| d.id.eq_ignore_ascii_case(id))
+    }
+
+    /// The microphone's entry, created flat on first touch.
+    pub fn mic_mut(&mut self, id: &str, name: &str) -> &mut DeviceEntry {
+        if let Some(i) = self.mics.iter().position(|d| d.id.eq_ignore_ascii_case(id)) {
+            if !name.is_empty() {
+                self.mics[i].name = name.to_string();
+            }
+            return &mut self.mics[i];
+        }
+        self.mics.push(DeviceEntry {
+            id: id.to_ascii_lowercase(),
+            name: name.to_string(),
+            follow_global: false,
+            chain: Chain::FLAT,
+            dismissed_suggestion: None,
+        });
+        self.mics.last_mut().unwrap()
+    }
+
+    /// Whether `target` is bypassed (outputs and microphones bypass separately).
+    pub fn bypassed(&self, target: &Target) -> bool {
+        if target.is_mic() { self.mic_bypass } else { self.bypass }
+    }
+
     pub fn device(&self, id: &str) -> Option<&DeviceEntry> {
         self.devices.iter().find(|d| d.id.eq_ignore_ascii_case(id))
     }
@@ -430,6 +525,7 @@ impl State {
     /// The chain actually used for a target (devices may follow global).
     pub fn chain(&self, target: &Target) -> &Chain {
         match target {
+            Target::Mic(id) => self.mic(id).map(|d| &d.chain).unwrap_or(&Chain::FLAT),
             Target::Device(id) if self.mode == Mode::PerDevice => match self.device(id) {
                 Some(d) if !d.follow_global => &d.chain,
                 _ => &self.global,
@@ -441,13 +537,16 @@ impl State {
     /// Whether edits to `target` land on its own chain or on the global one.
     pub fn owns_chain(&self, target: &Target) -> bool {
         match target {
-            Target::Global => true,
+            Target::Global | Target::Mic(_) => true,
             Target::Device(id) => self.mode == Mode::PerDevice && self.device(id).is_some_and(|d| !d.follow_global),
         }
     }
 
     /// Mutable chain for a target; device targets that follow global edit global.
     pub fn chain_mut(&mut self, target: &Target) -> &mut Chain {
+        if let Target::Mic(id) = target {
+            return &mut self.mic_mut(id, "").chain;
+        }
         if let Target::Device(id) = target
             && self.owns_chain(target)
             && let Some(i) = self.devices.iter().position(|d| d.id.eq_ignore_ascii_case(id))
@@ -476,12 +575,13 @@ impl State {
             return id;
         }
         let id = self.new_id();
-        let name = self.unique_name("Custom");
+        let name = self.unique_name(if target.is_mic() { "My mic" } else { "Custom" });
         self.profiles.push(Profile {
             id,
             name,
             tone: Tone::default(),
             bands: Vec::new(),
+            mic: target.is_mic(),
         });
         self.chain_mut(target).profile = Some(id);
         id
@@ -505,7 +605,7 @@ impl State {
             }
         };
         clear(&mut self.global);
-        for d in &mut self.devices {
+        for d in self.devices.iter_mut().chain(&mut self.mics) {
             clear(&mut d.chain);
         }
         self.rules
@@ -514,22 +614,32 @@ impl State {
 
     /// Case-insensitive lookup by id, exact name, then unique prefix/substring.
     pub fn find_profile(&self, query: &str) -> Option<u64> {
+        self.find_profile_in(query, None)
+    }
+
+    /// [`find_profile`](Self::find_profile), trying output (`Some(false)`) or
+    /// microphone (`Some(true)`) profiles first when a name fits both kinds.
+    pub fn find_profile_in(&self, query: &str, mic: Option<bool>) -> Option<u64> {
         let q = query.trim().to_lowercase();
         if let Ok(id) = q.parse::<u64>()
             && self.profile(id).is_some()
         {
             return Some(id);
         }
-        if let Some(p) = self.profiles.iter().find(|p| p.name.to_lowercase() == q) {
-            return Some(p.id);
-        }
-        for pred in [
-            &(|n: &str| n.starts_with(&q)) as &dyn Fn(&str) -> bool,
-            &(|n: &str| n.contains(&q)) as &dyn Fn(&str) -> bool,
-        ] {
-            let hits: Vec<_> = self.profiles.iter().filter(|p| pred(&p.name.to_lowercase())).collect();
-            if hits.len() == 1 {
-                return Some(hits[0].id);
+        let kinds: &[Option<bool>] = if mic.is_some() { &[mic, None] } else { &[None] };
+        for kind in kinds {
+            let pool: Vec<&Profile> = self.profiles.iter().filter(|p| kind.is_none_or(|m| p.mic == m)).collect();
+            if let Some(p) = pool.iter().find(|p| p.name.to_lowercase() == q) {
+                return Some(p.id);
+            }
+            for pred in [
+                &(|n: &str| n.starts_with(&q)) as &dyn Fn(&str) -> bool,
+                &(|n: &str| n.contains(&q)) as &dyn Fn(&str) -> bool,
+            ] {
+                let hits: Vec<_> = pool.iter().filter(|p| pred(&p.name.to_lowercase())).collect();
+                if hits.len() == 1 {
+                    return Some(hits[0].id);
+                }
             }
         }
         None
@@ -539,7 +649,10 @@ impl State {
         let path = crate::paths::state_file();
         match std::fs::read_to_string(&path) {
             Ok(text) => match serde_json::from_str::<State>(&text) {
-                Ok(s) => s,
+                Ok(mut s) => {
+                    s.seed_mic_presets();
+                    s
+                }
                 Err(_) => {
                     // Keep the unreadable file for the user instead of silently losing it.
                     let _ = std::fs::rename(&path, path.with_extension("json.broken"));

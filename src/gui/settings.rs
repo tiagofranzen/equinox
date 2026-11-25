@@ -47,6 +47,10 @@ impl App {
                 if switch_row(ui, &mut lm, self.accent, "Level-matched bypass", "Bypass keeps the preamp, so A/B compares the EQ itself, not loudness.") {
                     self.st.settings.level_matched_bypass = lm;
                 }
+                let mut fe = self.st.settings.fix_enhancements;
+                if switch_row(ui, &mut fe, self.accent, "Keep Windows Voice Clarity off EQ'd microphones", "Windows 11 runs either its own voice effect or the EQ on a microphone, never both. When Voice Clarity takes a microphone over, equinox switches it back.") {
+                    self.st.settings.fix_enhancements = fe;
+                }
                 ui.add_space(4.0);
                 ui.label(RichText::new("Extra headroom").color(TEXT));
                 ui.label(RichText::new("Added on top of the auto preamp, for players or effects that push near 0 dBFS.").size(11.5).color(DIM));
@@ -58,7 +62,7 @@ impl App {
 
             section(ui, "Display", |ui| {
                 let mut a = self.st.settings.analyzer;
-                if switch_row(ui, &mut a, self.accent, "Live spectrum", "Shows what's playing behind the EQ curve (captures system output; nothing is recorded).") {
+                if switch_row(ui, &mut a, self.accent, "Live spectrum", "Shows what's playing behind the EQ curve (system output, or your microphone on the Microphone tab; nothing is recorded).") {
                     self.st.settings.analyzer = a;
                 }
                 let mut b = self.st.settings.band_curves;
@@ -94,7 +98,7 @@ impl App {
                     kv(ui, "Version", &a.version);
                     kv(ui, "Config folder", &a.config.display().to_string());
                     kv(ui, "Loading equinox", if self.hooked { "Yes" } else { "No" });
-                    let on: Vec<String> = self.devices.iter().filter(|d| d.apo).map(|d| d.label()).collect();
+                    let on: Vec<String> = self.all_devices().filter(|d| d.apo).map(|d| d.label()).collect();
                     kv(ui, "Installed on", &if on.is_empty() { "No current device".to_string() } else { on.join(", ") });
                     if !self.foreign.is_empty() {
                         kv(ui, "Also active", &self.foreign.join(", "));
@@ -114,13 +118,83 @@ impl App {
                                 Err(e) => self.notify(format!("couldn't restore: {e}"), true),
                             }
                         }
-                        if ghost(ui, "Choose devices…").on_hover_text("Pick which outputs get the EQ").clicked() {
+                        if ghost(ui, "Choose devices…").on_hover_text("Pick which outputs and microphones get the EQ").clicked() {
                             self.open_picker(None);
                         }
                         if ghost(ui, "Open folder").clicked() {
                             sys::open_path(&a.config);
                         }
                     });
+                }
+            });
+
+            section(ui, "Updates", |ui| {
+                let mut au = self.st.settings.auto_update;
+                if switch_row(ui, &mut au, self.accent, "Check for updates when equinox starts", "Asks GitHub for the latest release. Nothing is installed until you click Update.") {
+                    self.st.settings.auto_update = au;
+                }
+                let version = equinox::update::current_version();
+                let (text, button) = match &self.update {
+                    super::UpdateState::Idle => (format!("You have equinox {version}."), Some("Check now")),
+                    super::UpdateState::Checking => ("Asking GitHub for the latest release…".to_string(), None),
+                    super::UpdateState::UpToDate => (format!("equinox {version} is the latest release."), Some("Check again")),
+                    super::UpdateState::Available(r) => (format!("equinox {} is available (you have {version}).", r.version), Some("Update now")),
+                    super::UpdateState::Downloading(r, p) => (format!("Downloading equinox {}… {:.0}%", r.version, p * 100.0), None),
+                    super::UpdateState::Failed(e) => (format!("Update failed: {e}"), Some("Try again")),
+                };
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(text).color(TEXT));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if let Some(b) = button {
+                            let available = matches!(self.update, super::UpdateState::Available(_));
+                            let clicked = if available { primary(ui, self.accent, b).clicked() } else { ghost(ui, b).clicked() };
+                            if clicked {
+                                if available {
+                                    self.install_update(&ctx);
+                                } else {
+                                    self.check_update(&ctx, true);
+                                }
+                            }
+                        } else {
+                            ui.spinner();
+                        }
+                    });
+                });
+            });
+
+            section(ui, "Libraries", |ui| {
+                ui.label(RichText::new("Both lists are checked for updates every time equinox starts. Offline, the last downloaded copy is used.").color(DIM));
+                let checked = |age: Option<std::time::Duration>, checking: bool| {
+                    if checking {
+                        return "checking for updates…".to_string();
+                    }
+                    match age.map(|a| a.as_secs() / 86400) {
+                        None => "built-in copy (not downloaded yet)".into(),
+                        Some(0) => "checked today".into(),
+                        Some(1) => "last checked yesterday".into(),
+                        Some(d) => format!("last checked {d} days ago"),
+                    }
+                };
+                let headphones = match &self.aeq.index {
+                    Some(idx) => format!("{} models from AutoEq  ·  {}", idx.len(), checked(equinox::autoeq::index_age(), self.aeq.checking)),
+                    None if self.aeq.checking => "loading…".to_string(),
+                    None => "not available (offline?)".to_string(),
+                };
+                kv(ui, "Headphones", &headphones);
+                let mics = format!(
+                    "{} models, list from {}  ·  {}",
+                    self.mlib.lib.mics.len(),
+                    self.mlib.lib.updated,
+                    if self.mlib.offline && !self.mlib.checking {
+                        "couldn't reach the server, using the saved copy".to_string()
+                    } else {
+                        checked(equinox::miclib::age(), self.mlib.checking)
+                    }
+                );
+                kv(ui, "Microphones", &mics);
+                if ghost(ui, "Check now").clicked() && !self.aeq.checking && !self.mlib.checking {
+                    self.load_index(&ctx);
+                    self.load_miclib(&ctx);
                 }
             });
 
@@ -136,6 +210,8 @@ impl App {
                         "eqx use \"bass boost\" -d headphones",
                         "eqx toggle",
                         "eqx autoeq apply hd 600 --strength 80",
+                        "eqx mic apply sm7b",
+                        "eqx use \"voice clarity\" --mic default",
                         "eqx band add pk 3000 -2.5 2",
                         "eqx curve",
                         "eqx status --json",
@@ -195,6 +271,8 @@ impl App {
             ui.horizontal(|ui| {
                 ui.label(RichText::new(format!("equinox {}  ·  Created by Visiuun", env!("CARGO_PKG_VERSION"))).size(11.5).color(DIM));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.hyperlink_to(RichText::new("equinox mic library").size(11.5), "https://github.com/visiuun/equinox/blob/main/library/mics.json");
+                    ui.label(RichText::new("·  Microphone data:").size(11.5).color(DIM));
                     ui.hyperlink_to(RichText::new("AutoEq").size(11.5), "https://github.com/jaakkopasanen/AutoEq");
                     ui.label(RichText::new("Headphone data:").size(11.5).color(DIM));
                 });

@@ -37,7 +37,7 @@ impl App {
 
             caption(ui, "Add a rule");
             ui.horizontal_wrapped(|ui| {
-                let current = self.st.chain(&self.target).profile.or(self.st.profiles.first().map(|p| p.id)).unwrap_or(0);
+                let current = self.st.chain(&self.target).profile.or(self.st.profiles_for(false).next().map(|p| p.id)).unwrap_or(0);
                 let find = |s: &equinox::model::State, n: &str| s.find_profile(n).unwrap_or(current);
                 let mut add = None;
                 if ghost(ui, "🎧  When an output is selected").clicked() {
@@ -126,7 +126,8 @@ impl App {
         let mut op = RuleOp::None;
         let active = self.active_rules.contains(&r.id);
         let devices: Vec<AudioDevice> = self.devices.clone();
-        let profiles: Vec<(u64, String)> = self.st.profiles.iter().map(|p| (p.id, p.name.clone())).collect();
+        // Rules act on outputs, so they offer output profiles.
+        let profiles: Vec<(u64, String)> = self.st.profiles_for(false).map(|p| (p.id, p.name.clone())).collect();
         let per_device = self.st.mode == Mode::PerDevice;
         let accent = self.accent;
         let frame = if active {
@@ -284,7 +285,7 @@ impl App {
                     let label = |t: &Target| match t {
                         Target::Global if per_device => "Default".to_string(),
                         Target::Global => "All devices".to_string(),
-                        Target::Device(id) => devices
+                        Target::Device(id) | Target::Mic(id) => devices
                             .iter()
                             .find(|d| &d.id == id)
                             .map(|d| d.label())

@@ -1,5 +1,6 @@
-//! Live spectrum of whatever is playing, via WASAPI loopback on the default
-//! output. Capture runs on its own thread; the UI pulls a spectrum per frame.
+//! Live spectrum of whatever is playing (WASAPI loopback on the default
+//! output) or of a microphone. Capture runs on its own thread; the UI pulls a
+//! spectrum per frame.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -10,8 +11,21 @@ use windows::Win32::Media::Audio::{
     IMMDeviceEnumerator, MMDeviceEnumerator, eConsole, eRender,
 };
 use windows::Win32::System::Com::{CLSCTX_ALL, CoCreateInstance, CoTaskMemFree};
+use windows::core::HSTRING;
+
+use crate::wasapi::Format;
 
 const N: usize = 4096;
+
+/// What the analyzer listens to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Source {
+    /// Whatever is playing on the default output.
+    Output,
+    /// A microphone, by endpoint GUID. Shared-mode capture comes after the
+    /// endpoint's effects, so this is the microphone with its EQ applied.
+    Mic(String),
+}
 
 struct Ring {
     buf: Vec<f32>,
@@ -21,6 +35,7 @@ struct Ring {
 }
 
 pub struct Analyzer {
+    source: Source,
     ring: Arc<Mutex<Ring>>,
     stop: Arc<AtomicBool>,
     window: Vec<f32>,
@@ -29,7 +44,7 @@ pub struct Analyzer {
 }
 
 impl Analyzer {
-    pub fn start() -> Analyzer {
+    pub fn start(source: Source) -> Analyzer {
         let ring = Arc::new(Mutex::new(Ring {
             buf: vec![0.0; N],
             pos: 0,
@@ -37,21 +52,26 @@ impl Analyzer {
             last: Instant::now(),
         }));
         let stop = Arc::new(AtomicBool::new(false));
-        let (r, s) = (ring.clone(), stop.clone());
+        let (r, s, src) = (ring.clone(), stop.clone(), source.clone());
         std::thread::Builder::new()
-            .name("loopback".into())
-            .spawn(move || capture_loop(r, s))
+            .name("analyzer".into())
+            .spawn(move || capture_loop(src, r, s))
             .ok();
         let window = (0..N)
             .map(|i| 0.5 - 0.5 * (2.0 * std::f32::consts::PI * i as f32 / N as f32).cos())
             .collect();
         Analyzer {
+            source,
             ring,
             stop,
             window,
             re: vec![0.0; N],
             im: vec![0.0; N],
         }
+    }
+
+    pub fn source(&self) -> &Source {
+        &self.source
     }
 
     /// Level in dB at each frequency (pink-tilted +3 dB/oct around 1 kHz so
@@ -102,24 +122,28 @@ impl Drop for Analyzer {
     }
 }
 
-fn capture_loop(ring: Arc<Mutex<Ring>>, stop: Arc<AtomicBool>) {
+fn capture_loop(source: Source, ring: Arc<Mutex<Ring>>, stop: Arc<AtomicBool>) {
     crate::sys::com_init();
     while !stop.load(Ordering::Relaxed) {
         // Re-opens on default device changes and after errors (device unplugged...).
-        let _ = unsafe { capture_session(&ring, &stop) };
+        let _ = unsafe { capture_session(&source, &ring, &stop) };
         std::thread::sleep(Duration::from_millis(500));
     }
 }
 
-unsafe fn capture_session(ring: &Mutex<Ring>, stop: &AtomicBool) -> windows::core::Result<()> {
+unsafe fn capture_session(source: &Source, ring: &Mutex<Ring>, stop: &AtomicBool) -> windows::core::Result<()> {
     unsafe {
         let en: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
-        let dev = en.GetDefaultAudioEndpoint(eRender, eConsole)?;
+        let (dev, flags) = match source {
+            Source::Output => (en.GetDefaultAudioEndpoint(eRender, eConsole)?, AUDCLNT_STREAMFLAGS_LOOPBACK),
+            Source::Mic(guid) => (en.GetDevice(&HSTRING::from(crate::sys::endpoint_id(guid, true)))?, 0),
+        };
         let dev_id = dev.GetId()?.to_string().unwrap_or_default();
         let client: IAudioClient = dev.Activate(CLSCTX_ALL, None)?;
         let fmt = client.GetMixFormat()?;
-        let (channels, bits, rate) = ((*fmt).nChannels as usize, (*fmt).wBitsPerSample, (*fmt).nSamplesPerSec);
-        let init = client.Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK, 1_000_000, 0, fmt, None);
+        let format = Format::read(fmt);
+        let (channels, rate) = (format.channels, format.rate);
+        let init = client.Initialize(AUDCLNT_SHAREMODE_SHARED, flags, 1_000_000, 0, fmt, None);
         CoTaskMemFree(Some(fmt as _));
         init?;
         let cap: IAudioCaptureClient = client.GetService()?;
@@ -129,6 +153,7 @@ unsafe fn capture_session(ring: &Mutex<Ring>, stop: &AtomicBool) -> windows::cor
         }
         let mut last_check = Instant::now();
         let mut mono = Vec::new();
+        let mut all = Vec::new();
         while !stop.load(Ordering::Relaxed) {
             let mut n = cap.GetNextPacketSize()?;
             while n > 0 {
@@ -140,15 +165,10 @@ unsafe fn capture_session(ring: &Mutex<Ring>, stop: &AtomicBool) -> windows::cor
                 let fr = frames as usize;
                 if flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0 || data.is_null() || channels == 0 {
                     mono.resize(fr, 0.0);
-                } else if bits == 32 {
-                    let s = std::slice::from_raw_parts(data as *const f32, fr * channels);
-                    mono.extend(s.chunks_exact(channels).map(|c| c.iter().sum::<f32>() / channels as f32));
-                } else if bits == 16 {
-                    let s = std::slice::from_raw_parts(data as *const i16, fr * channels);
-                    mono.extend(
-                        s.chunks_exact(channels)
-                            .map(|c| c.iter().map(|&v| v as f32 / 32768.0).sum::<f32>() / channels as f32),
-                    );
+                } else {
+                    all.clear();
+                    format.floats(data, fr, &mut all);
+                    mono.extend(all.chunks_exact(channels).map(|c| c.iter().sum::<f32>() / channels as f32));
                 }
                 cap.ReleaseBuffer(frames)?;
                 if let Ok(mut r) = ring.lock() {
@@ -163,7 +183,7 @@ unsafe fn capture_session(ring: &Mutex<Ring>, stop: &AtomicBool) -> windows::cor
                 }
                 n = cap.GetNextPacketSize()?;
             }
-            if last_check.elapsed() > Duration::from_secs(1) {
+            if *source == Source::Output && last_check.elapsed() > Duration::from_secs(1) {
                 last_check = Instant::now();
                 let now = en
                     .GetDefaultAudioEndpoint(eRender, eConsole)
@@ -181,7 +201,7 @@ unsafe fn capture_session(ring: &Mutex<Ring>, stop: &AtomicBool) -> windows::cor
 }
 
 /// In-place iterative radix-2 FFT.
-fn fft(re: &mut [f32], im: &mut [f32]) {
+pub(crate) fn fft(re: &mut [f32], im: &mut [f32]) {
     let n = re.len();
     let mut j = 0;
     for i in 1..n {

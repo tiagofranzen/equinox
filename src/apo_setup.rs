@@ -1,4 +1,4 @@
-//! Installing Equalizer APO on output devices, without its Device Selector.
+//! Installing Equalizer APO on outputs and microphones, without its Device Selector.
 //!
 //! It uses the same registry layout and test pipe as Equalizer APO 1.4 by
 //! Jonas Thedering, so installs made here and by Device Selector are interchangeable:
@@ -6,6 +6,8 @@
 //! point the endpoint at Equalizer APO's pre/post-mix APOs, restart the audio
 //! service, then confirm over the APO's test pipe that it really loaded,
 //! falling back through the install modes (SFX/EFX, SFX/MFX, LFX/GFX) if not.
+//! Microphones (capture endpoints) only take the pre-mix APO; Equalizer APO runs
+//! the config's `capture` stage there.
 //!
 //! Everything here needs admin; the app runs it via `equinox.exe --apo-setup`
 //! in an elevated child process ([`run_elevated`]), so there's one UAC prompt.
@@ -23,7 +25,6 @@ use serde::{Deserialize, Serialize};
 use winreg::RegKey;
 use winreg::enums::{HKEY_CLASSES_ROOT, HKEY_LOCAL_MACHINE, KEY_READ, KEY_SET_VALUE, KEY_WRITE, RegType};
 
-const RENDER: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Render";
 const APP: &str = r"SOFTWARE\EqualizerAPO";
 const CHILD: &str = r"SOFTWARE\EqualizerAPO\Child APOs";
 const PRE_MIX: &str = "{EACD2258-FCAC-4FF4-B36D-419E924A6D79}";
@@ -52,6 +53,7 @@ const EFX_MODES: &str = "{d3993a3f-99c2-4402-b5ec-a92a0367664b},7";
 const DEFAULT_PROCESSING_MODE: &str = "{C18E2F7E-933D-4965-B7D1-1EEF228D2AF3}";
 const DISABLE_ENHANCEMENTS: &str = "{1da5d803-d492-4edd-8c23-e0c0ffee7f0e},5";
 const COMBINED_DEVICE: &str = "{b3f8fa53-0004-438e-9003-51a46e139bfc},41";
+const FX_TITLE: &str = "{b725f130-47ef-101a-a5f1-02608c9eebac},10";
 const NO_VALUE: &str = "!VALUE";
 const NO_KEY: &str = "!KEY";
 const INSTALL_VERSION: &str = "2";
@@ -82,6 +84,9 @@ pub struct DeviceResult {
     pub verified: Option<bool>,
     pub mode: Option<Mode>,
     pub message: String,
+    /// Something else that was changed for this device, in plain words.
+    #[serde(default)]
+    pub note: String,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -94,6 +99,10 @@ pub struct Report {
 /// What we know about one endpoint's effect registration.
 struct Dev {
     guid: String,
+    /// Registry path of the endpoint (under Render or Capture).
+    key: String,
+    /// A capture endpoint: only the pre-mix APO is installed.
+    input: bool,
     /// Original CLSIDs per FX slot, or `!VALUE` / `!KEY`.
     originals: [String; 5],
     installed: bool,
@@ -133,11 +142,22 @@ fn set_multi(key: &RegKey, name: &str, value: &str) -> io::Result<()> {
 }
 
 fn load(guid: &str) -> io::Result<Dev> {
-    let dev_key = hklm().open_subkey_with_flags(format!(r"{RENDER}\{guid}"), KEY_READ)?;
+    // An endpoint GUID lives in exactly one branch; outputs are checked first.
+    let render = format!(r"{}\{guid}", crate::devices::branch(false));
+    let (key, input, dev_key) = match hklm().open_subkey_with_flags(&render, KEY_READ) {
+        Ok(k) => (render, false, k),
+        Err(_) => {
+            let capture = format!(r"{}\{guid}", crate::devices::branch(true));
+            let k = hklm().open_subkey_with_flags(&capture, KEY_READ)?;
+            (capture, true, k)
+        }
+    };
     let state: u32 = dev_key.get_value("DeviceState").unwrap_or(0);
-    let active = state & 0xF == 1;
+    let active = state & 0x1000_000F == 1;
     let mut d = Dev {
         guid: guid.to_string(),
+        key,
+        input,
         originals: std::array::from_fn(|_| NO_KEY.to_string()),
         installed: false,
         has_fx_key: false,
@@ -215,6 +235,9 @@ fn original_pre(d: &Dev, mode: Mode) -> String {
 }
 
 fn original_post(d: &Dev, mode: Mode) -> String {
+    if d.input {
+        return String::new();
+    }
     let o = &d.originals;
     let g = match mode {
         Mode::LfxGfx if o[LFX] == NO_VALUE && o[GFX] == NO_VALUE => &o[MFX],
@@ -228,16 +251,27 @@ fn original_post(d: &Dev, mode: Mode) -> String {
 }
 
 fn install(d: &Dev, mode: Mode) -> io::Result<()> {
+    let fx_path = format!(r"{}\FxProperties", d.key);
     if !d.has_fx_key {
-        return Err(io::Error::other(
-            "this device has no effects key; use Equalizer APO's Device Selector for it",
-        ));
+        // Device Selector calls these devices experimental: there is no effects
+        // key yet, so make one (uninstalling removes it again).
+        let (fx, _) = hklm().create_subkey_with_flags(&fx_path, KEY_READ | KEY_SET_VALUE).map_err(|e| {
+            io::Error::other(format!(
+                "this device has no effects key and Windows wouldn't let one be created ({e}); use Equalizer APO's Device Selector for it"
+            ))
+        })?;
+        fx.set_value(FX_TITLE, &"Equalizer APO")?;
     }
     let (child, _) = hklm().create_subkey_with_flags(format!(r"{CHILD}\{}", d.guid), KEY_READ | KEY_WRITE)?;
-    let fx = hklm().open_subkey_with_flags(format!(r"{RENDER}\{}\FxProperties", d.guid), KEY_READ | KEY_SET_VALUE)?;
+    let fx = hklm().open_subkey_with_flags(&fx_path, KEY_READ | KEY_SET_VALUE)?;
     // Back up what's there now (on a fresh install, the driver's APOs).
     for name in FX {
-        child.set_value(name, &get(&fx, name).unwrap_or_else(|| NO_VALUE.into()))?;
+        let original = if d.has_fx_key {
+            get(&fx, name).unwrap_or_else(|| NO_VALUE.into())
+        } else {
+            NO_KEY.into()
+        };
+        child.set_value(name, &original)?;
     }
     child.set_value("PreMixChild", &original_pre(d, mode))?;
     child.set_value("PostMixChild", &original_post(d, mode))?;
@@ -245,10 +279,13 @@ fn install(d: &Dev, mode: Mode) -> io::Result<()> {
     del(&child, "DisableAutomaticAdjustment")?;
     child.set_value("Version", &INSTALL_VERSION)?;
 
+    // Microphones get the pre-mix APO only, like Device Selector does.
     match mode {
         Mode::LfxGfx => {
             fx.set_value(FX[LFX], &PRE_MIX)?;
-            fx.set_value(FX[GFX], &POST_MIX)?;
+            if !d.input {
+                fx.set_value(FX[GFX], &POST_MIX)?;
+            }
             for i in [SFX, MFX, EFX] {
                 del(&fx, FX[i])?;
             }
@@ -260,10 +297,12 @@ fn install(d: &Dev, mode: Mode) -> io::Result<()> {
             if get(&fx, SFX_MODES).is_none() && fx.get_raw_value(SFX_MODES).is_err() {
                 set_multi(&fx, SFX_MODES, DEFAULT_PROCESSING_MODE)?;
             }
-            let (slot, modes) = if mode == Mode::SfxMfx { (MFX, MFX_MODES) } else { (EFX, EFX_MODES) };
-            fx.set_value(FX[slot], &POST_MIX)?;
-            if fx.get_raw_value(modes).is_err() {
-                set_multi(&fx, modes, DEFAULT_PROCESSING_MODE)?;
+            if !d.input {
+                let (slot, modes) = if mode == Mode::SfxMfx { (MFX, MFX_MODES) } else { (EFX, EFX_MODES) };
+                fx.set_value(FX[slot], &POST_MIX)?;
+                if fx.get_raw_value(modes).is_err() {
+                    set_multi(&fx, modes, DEFAULT_PROCESSING_MODE)?;
+                }
             }
         }
     }
@@ -272,8 +311,11 @@ fn install(d: &Dev, mode: Mode) -> io::Result<()> {
 }
 
 fn uninstall(d: &Dev) -> io::Result<()> {
-    if d.has_fx_key {
-        let fx = hklm().open_subkey_with_flags(format!(r"{RENDER}\{}\FxProperties", d.guid), KEY_READ | KEY_SET_VALUE)?;
+    if d.has_fx_key && d.originals[0] == NO_KEY {
+        // The effects key was made by the install: take it away again.
+        hklm().delete_subkey_all(format!(r"{}\FxProperties", d.key))?;
+    } else if d.has_fx_key {
+        let fx = hklm().open_subkey_with_flags(format!(r"{}\FxProperties", d.key), KEY_READ | KEY_SET_VALUE)?;
         for i in 0..5 {
             let o = &d.originals[i];
             if o == NO_VALUE || o == NO_KEY {
@@ -384,7 +426,7 @@ fn restart_audio_service() -> Result<(), String> {
     Ok(())
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, Debug)]
 struct Probe {
     pre: bool,
     post: bool,
@@ -484,7 +526,7 @@ fn stop_pipe_server() {
 }
 
 /// Open a shared-mode stream so the audio engine loads the endpoint's APOs.
-fn poke(guid: &str) {
+fn poke(guid: &str, input: bool) {
     use windows::Win32::Media::Audio::{AUDCLNT_SHAREMODE_SHARED, IAudioClient, IMMDeviceEnumerator, MMDeviceEnumerator};
     use windows::Win32::System::Com::{CLSCTX_ALL, CoCreateInstance, CoTaskMemFree};
     use windows::core::HSTRING;
@@ -493,7 +535,7 @@ fn poke(guid: &str) {
         let Ok(en) = CoCreateInstance::<_, IMMDeviceEnumerator>(&MMDeviceEnumerator, None, CLSCTX_ALL) else {
             return;
         };
-        let Ok(dev) = en.GetDevice(&HSTRING::from(format!("{{0.0.0.00000000}}.{guid}"))) else {
+        let Ok(dev) = en.GetDevice(&HSTRING::from(crate::sys::endpoint_id(guid, input))) else {
             return;
         };
         let Ok(client) = dev.Activate::<IAudioClient>(CLSCTX_ALL, None) else {
@@ -515,7 +557,9 @@ fn test(devs: &[&Dev], modes: &HashMap<String, Mode>) -> HashMap<String, Probe> 
                 d.guid.clone(),
                 Probe {
                     pre_child: original_pre(d, m).is_empty(),
-                    post_child: original_post(d, m).is_empty(),
+                    // No post-mix APO on microphones, so nothing to wait for.
+                    post: d.input,
+                    post_child: d.input || original_post(d, m).is_empty(),
                     ..Default::default()
                 },
             )
@@ -528,7 +572,7 @@ fn test(devs: &[&Dev], modes: &HashMap<String, Mode>) -> HashMap<String, Probe> 
     }
     std::thread::sleep(Duration::from_millis(100));
     for d in devs {
-        poke(&d.guid);
+        poke(&d.guid, d.input);
     }
     let deadline = Instant::now() + Duration::from_secs(3);
     while Instant::now() < deadline && !probes.values().all(Probe::ok) {
@@ -597,6 +641,15 @@ pub fn setup(install_guids: &[String], uninstall_guids: &[String]) -> Report {
             Ok(d) => {
                 r.installed = true;
                 r.mode = Some(d.mode);
+                // A Windows effect pack (Voice Clarity) would run instead of
+                // Equalizer APO. The audio service restart below applies the switch.
+                if d.input && crate::enhance::overridden(g, true) {
+                    let pack = crate::enhance::pack_name(g, true);
+                    r.note = match crate::enhance::use_device_effects(g, true) {
+                        Ok(()) => format!("{pack} was turned off for it: Windows runs either that or the EQ"),
+                        Err(e) => format!("{pack} is still in the way: {e}"),
+                    };
+                }
                 modes.insert(g.clone(), d.mode);
                 remaining.insert(
                     g.clone(),
@@ -817,6 +870,8 @@ mod tests {
     fn dev(o: [&str; 5]) -> Dev {
         Dev {
             guid: "{x}".into(),
+            key: String::new(),
+            input: false,
             originals: o.map(String::from),
             installed: false,
             has_fx_key: true,
@@ -842,6 +897,15 @@ mod tests {
         let none = dev([NO_KEY; 5]);
         assert_eq!(original_pre(&none, Mode::SfxEfx), "");
     }
+
+    #[test]
+    fn microphones_keep_only_a_pre_mix_child() {
+        let mut mic = dev([NO_VALUE, NO_VALUE, "{S}", "{M}", "{E}"]);
+        mic.input = true;
+        assert_eq!(original_pre(&mic, Mode::SfxEfx), "{S}");
+        assert_eq!(original_post(&mic, Mode::SfxEfx), "");
+        assert_eq!(original_post(&mic, Mode::SfxMfx), "");
+    }
 }
 
 #[cfg(test)]
@@ -858,10 +922,12 @@ mod live {
     #[test]
     #[ignore]
     fn plan() {
-        for d in crate::devices::list().iter().filter(|d| d.active) {
+        let all = crate::devices::list().into_iter().chain(crate::devices::list_capture());
+        for d in all.filter(|d| d.active) {
             match super::load(&d.id) {
                 Ok(x) => println!(
-                    "{:<45} installed={} fx_key={} mode={:?} keep pre={:?} post={:?}",
+                    "{} {:<45} installed={} fx_key={} mode={:?} keep pre={:?} post={:?}",
+                    if x.input { "in " } else { "out" },
                     d.label(),
                     x.installed,
                     x.has_fx_key,

@@ -15,6 +15,7 @@ use equinox::devices::{self, AudioDevice};
 use equinox::dsp;
 use equinox::engine::{self, Resolved};
 use equinox::eqtext;
+use equinox::miclib;
 use equinox::model::{Action, Band, Correction, FilterKind, Mode, Profile, State, Target, Tone, Trigger};
 use equinox::sys;
 
@@ -31,7 +32,16 @@ EXAMPLES
   eqx curve                          draw the response in the terminal
   eqx import my.txt --correction     load an Equalizer APO / AutoEq / REW / CSV file
 
+MICROPHONES
+  eqx mic list                       input devices
+  eqx mic apply solocast             find a microphone in the library and correct it
+  eqx use \"voice clarity\" --mic default    any command works on a microphone with --mic
+  eqx tone --bass 2 --mic default
+  eqx off --mic default              bypass the microphone EQ only
+  eqx mic monitor                    hear yourself (Enter stops)
+
 Devices (-d) match by name, GUID or 'default'; 'all' means the global chain.
+--mic takes a microphone the same way and makes the command act on it.
 ";
 
 #[derive(Parser)]
@@ -40,6 +50,9 @@ struct Cli {
     /// Machine-readable output.
     #[arg(long, global = true)]
     json: bool,
+    /// Act on a microphone instead of an output: name, GUID or 'default'.
+    #[arg(short = 'm', long, global = true, value_name = "MIC")]
+    mic: Option<String>,
     #[command(subcommand)]
     cmd: Option<Cmd>,
 }
@@ -137,6 +150,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: AutoEqCmd,
     },
+    /// Microphones: devices, the correction library, and hearing yourself.
+    Mic {
+        #[command(subcommand)]
+        cmd: MicCmd,
+    },
     /// How much of the headphone correction to apply, 0-150 %.
     Strength {
         percent: f32,
@@ -166,6 +184,11 @@ enum Cmd {
     Open,
     /// Re-write the Equalizer APO config from the saved state.
     Apply,
+    /// Install the latest release from GitHub (or just look with --check).
+    Update {
+        #[arg(long)]
+        check: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -253,6 +276,63 @@ enum AutoEqCmd {
 }
 
 #[derive(Subcommand)]
+enum MicCmd {
+    /// List input devices.
+    List,
+    /// Search the microphone library (no query lists everything).
+    Search {
+        query: Vec<String>,
+        #[arg(short = 'n', long, default_value_t = 60)]
+        limit: usize,
+    },
+    /// Apply the best match (or --pick N from the search list) to a microphone.
+    Apply {
+        query: Vec<String>,
+        #[arg(long)]
+        pick: Option<usize>,
+        /// The microphone to correct (default: the default input).
+        #[arg(short, long)]
+        device: Option<String>,
+        /// 0-150 %.
+        #[arg(long)]
+        strength: Option<f32>,
+    },
+    /// Remove the microphone correction.
+    Clear {
+        #[arg(short, long)]
+        device: Option<String>,
+    },
+    /// Guess microphone models from connected device names.
+    Suggest,
+    /// Re-download the microphone library.
+    Refresh,
+    /// Turn off a Windows enhancement (Voice Clarity) that keeps the EQ from reaching the microphone.
+    Fix {
+        #[arg(short, long)]
+        device: Option<String>,
+    },
+    /// Measure whether the EQ really reaches the microphone (compares its raw and processed signal).
+    Check {
+        #[arg(short, long)]
+        device: Option<String>,
+        /// How long to listen.
+        #[arg(long, default_value_t = 3.0)]
+        seconds: f32,
+    },
+    /// Hear yourself: play the microphone, EQ included, through the default output.
+    Monitor {
+        #[arg(short, long)]
+        device: Option<String>,
+        /// Playback volume, 0-200 %.
+        #[arg(long, default_value_t = 100.0)]
+        volume: f32,
+        /// Stop after this many seconds instead of waiting for Enter.
+        #[arg(long)]
+        seconds: Option<f32>,
+    },
+}
+
+#[derive(Subcommand)]
 enum RuleCmd {
     List,
     Enable { rule: String },
@@ -312,14 +392,31 @@ fn main() -> ExitCode {
 struct Ctx {
     state: State,
     devices: Vec<AudioDevice>,
+    mics: Vec<AudioDevice>,
+    /// `--mic`: the command acts on this microphone.
+    mic: Option<String>,
     json: bool,
 }
 
 impl Ctx {
-    /// Which chain a command acts on. No -d: the default device in per-device
-    /// mode, else global. An explicit device gets its own chain (switching to
-    /// per-device mode if needed).
+    /// A microphone by name, GUID or 'default'. Its entry is created when `write`.
+    fn mic_target(&mut self, query: &str, write: bool) -> Result<Target> {
+        let d = devices::find(&self.mics, query)
+            .ok_or_else(|| anyhow!("no microphone matches '{query}' (see `eqx mic list`)"))?
+            .clone();
+        if write {
+            self.state.mic_mut(&d.id, &d.label());
+        }
+        Ok(Target::Mic(d.id))
+    }
+
+    /// Which chain a command acts on. With --mic: that microphone. No -d: the
+    /// default device in per-device mode, else global. An explicit device gets
+    /// its own chain (switching to per-device mode if needed).
     fn target(&mut self, device: &Option<String>, write: bool) -> Result<Target> {
+        if let Some(q) = self.mic.clone() {
+            return self.mic_target(&q, write);
+        }
         let Some(q) = device else {
             return Ok(match (self.state.mode, self.devices.iter().find(|d| d.default)) {
                 (Mode::PerDevice, Some(d)) => Target::Device(d.id.clone()),
@@ -351,15 +448,26 @@ impl Ctx {
                 .map(|d| d.label())
                 .or_else(|| self.state.device(id).map(|d| d.name.clone()))
                 .unwrap_or_else(|| id.clone()),
+            Target::Mic(id) => self
+                .mics
+                .iter()
+                .find(|d| &d.id == id)
+                .map(|d| d.label())
+                .or_else(|| self.state.mic(id).map(|d| d.name.clone()).filter(|n| !n.is_empty()))
+                .unwrap_or_else(|| id.clone()),
         }
+    }
+
+    /// A profile by name, preferring the kind (output or microphone) the command is about.
+    fn find_profile(&self, query: &str) -> Result<u64> {
+        self.state
+            .find_profile_in(query, Some(self.mic.is_some()))
+            .ok_or_else(|| anyhow!("no profile matches '{query}' (see `eqx profiles`)"))
     }
 
     fn profile_arg(&mut self, profile: &Option<String>, device: &Option<String>) -> Result<u64> {
         match profile {
-            Some(p) => self
-                .state
-                .find_profile(p)
-                .ok_or_else(|| anyhow!("no profile matches '{p}' (see `eqx profiles`)")),
+            Some(p) => self.find_profile(p),
             None => {
                 let t = self.target(device, true)?;
                 Ok(self.state.ensure_profile(&t))
@@ -377,13 +485,24 @@ impl Ctx {
         } else if !rep.hooked {
             eprintln!("warning: Equalizer APO isn't loading equinox yet; run `eqx apo hook`");
         }
-        if let Some(d) = self.devices.iter().find(|d| d.default)
+        if self.mic.is_none()
+            && let Some(d) = self.devices.iter().find(|d| d.default)
             && !d.apo
         {
             eprintln!(
                 "warning: Equalizer APO isn't installed on '{}'; run `eqx apo enable default`",
                 d.label()
             );
+        }
+        // A microphone with an EQ that the audio engine can't apply yet.
+        for d in self.mics.iter().filter(|d| d.active && !d.apo) {
+            if self.state.mic(&d.id).is_some_and(|m| m.chain != equinox::model::Chain::FLAT) {
+                eprintln!(
+                    "warning: Equalizer APO isn't installed on '{}'; run `eqx apo enable \"{}\"`",
+                    d.label(),
+                    d.interface
+                );
+            }
         }
         Ok(())
     }
@@ -404,6 +523,8 @@ fn run(cli: Cli) -> Result<()> {
     let mut c = Ctx {
         state: State::load(),
         devices: devices::list(),
+        mics: devices::list_capture(),
+        mic: cli.mic,
         json: cli.json,
     };
     match cli.cmd.unwrap_or(Cmd::Status) {
@@ -431,36 +552,39 @@ fn run(cli: Cli) -> Result<()> {
         Cmd::Profiles => {
             let in_use: Vec<u64> = std::iter::once(&c.state.global)
                 .chain(c.state.devices.iter().map(|d| &d.chain))
+                .chain(c.state.mics.iter().map(|d| &d.chain))
                 .filter_map(|ch| ch.profile)
                 .collect();
             c.print(
                 || {
-                    c.state
-                        .profiles
-                        .iter()
-                        .map(|p| {
-                            format!(
+                    let mut s = String::new();
+                    for (mic, title) in [(false, "Outputs"), (true, "Microphones")] {
+                        s += &format!("{title}\n");
+                        for p in c.state.profiles_for(mic) {
+                            s += &format!(
                                 "{} {:>3}  {:<22} {}\n",
                                 if in_use.contains(&p.id) { "●" } else { " " },
                                 p.id,
                                 p.name,
                                 describe(p)
-                            )
-                        })
-                        .collect()
+                            );
+                        }
+                    }
+                    s
                 },
                 || serde_json::to_value(&c.state.profiles).unwrap(),
             );
             Ok(())
         }
         Cmd::Use { profile, device } => {
-            let id = c
-                .state
-                .find_profile(&profile)
-                .ok_or_else(|| anyhow!("no profile matches '{profile}' (see `eqx profiles`)"))?;
+            let id = c.find_profile(&profile)?;
             let t = c.target(&device, true)?;
             c.state.chain_mut(&t).profile = Some(id);
-            c.state.bypass = false;
+            if t.is_mic() {
+                c.state.mic_bypass = false;
+            } else {
+                c.state.bypass = false;
+            }
             c.commit()?;
             let name = c.state.profile(id).unwrap().name.clone();
             c.print(
@@ -486,6 +610,8 @@ fn run(cli: Cli) -> Result<()> {
         }
         Cmd::Preamp { value, device } => {
             let t = c.target(&device, true)?;
+            // Microphones often need real gain, outputs rarely do.
+            let max = if t.is_mic() { 24.0 } else { 12.0 };
             let ch = c.state.chain_mut(&t);
             if value.eq_ignore_ascii_case("auto") {
                 ch.auto_preamp = true;
@@ -496,7 +622,7 @@ fn run(cli: Cli) -> Result<()> {
                     .trim()
                     .parse::<f32>()
                     .context("preamp: a number in dB, or auto")?
-                    .clamp(-30.0, 12.0);
+                    .clamp(-30.0, max);
             }
             c.commit()?;
             let r = engine::resolve(&c.state, c.state.chain(&t));
@@ -587,6 +713,7 @@ fn run(cli: Cli) -> Result<()> {
                     name: name.clone(),
                     tone: Tone::default(),
                     bands: parsed.bands,
+                    mic: t.is_mic(),
                 });
                 c.state.chain_mut(&t).profile = Some(id);
                 c.commit()?;
@@ -600,7 +727,7 @@ fn run(cli: Cli) -> Result<()> {
         Cmd::Export { profile, device, out } => {
             let text = match &profile {
                 Some(p) => {
-                    let id = c.state.find_profile(p).ok_or_else(|| anyhow!("no profile matches '{p}'"))?;
+                    let id = c.find_profile(p)?;
                     let bands = c.state.profile(id).unwrap().filters();
                     eqtext::export(dsp::auto_preamp(&bands, &[], 0.0), &bands, &[])
                 }
@@ -620,11 +747,17 @@ fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Cmd::Autoeq { cmd } => autoeq_cmd(&mut c, cmd),
+        Cmd::Mic { cmd } => mic_cmd(&mut c, cmd),
         Cmd::Strength { percent, device } => {
             let t = c.target(&device, true)?;
             let ch = c.state.chain_mut(&t);
             if ch.correction.is_none() {
-                bail!("{} has no headphone correction (try `eqx autoeq apply <model>`)", c.target_name(&t));
+                let hint = if t.is_mic() {
+                    "eqx mic apply <model>"
+                } else {
+                    "eqx autoeq apply <model>"
+                };
+                bail!("{} has no correction (try `{hint}`)", c.target_name(&t));
             }
             ch.strength = (percent / 100.0).clamp(0.0, 1.5);
             c.commit()?;
@@ -689,14 +822,60 @@ fn run(cli: Cli) -> Result<()> {
             c.print(|| "applied".into(), || json!({"applied": true}));
             Ok(())
         }
+        Cmd::Update { check } => {
+            let current = equinox::update::current_version();
+            let Some(rel) = equinox::update::check().map_err(|e| anyhow!(e))? else {
+                c.print(
+                    || format!("equinox {current} is the latest release"),
+                    || json!({"current": current, "available": null}),
+                );
+                return Ok(());
+            };
+            if check {
+                c.print(
+                    || {
+                        format!(
+                            "equinox {} is available (you have {current}); run `eqx update` to install it",
+                            rel.version
+                        )
+                    },
+                    || json!({"current": current, "available": rel.version}),
+                );
+                return Ok(());
+            }
+            eprintln!("Downloading equinox {}…", rel.version);
+            // The tray agent is stopped for the swap; bring it back if it was running.
+            let agent = sys::agent_running();
+            equinox::update::install(&rel, |_| {}).map_err(|e| anyhow!(e))?;
+            if agent {
+                sys::start_agent();
+            }
+            c.print(
+                || {
+                    format!(
+                        "updated to equinox {} (an open equinox window keeps the old version until you reopen it)",
+                        rel.version
+                    )
+                },
+                || json!({"updated": rel.version}),
+            );
+            Ok(())
+        }
     }
 }
 
+/// Outputs and microphones bypass separately; --mic picks the microphone side.
 fn set_bypass(c: &mut Ctx, bypass: Option<bool>) -> Result<()> {
-    c.state.bypass = bypass.unwrap_or(!c.state.bypass);
+    let mic = c.mic.is_some();
+    let flag = if mic { &mut c.state.mic_bypass } else { &mut c.state.bypass };
+    *flag = bypass.unwrap_or(!*flag);
+    let on = !*flag;
     c.commit()?;
-    let on = !c.state.bypass;
-    c.print(|| (if on { "EQ on" } else { "EQ bypassed" }).into(), || json!({"enabled": on}));
+    let what = if mic { "microphone EQ" } else { "EQ" };
+    c.print(
+        || format!("{what} {}", if on { "on" } else { "bypassed" }),
+        || json!({"enabled": on, "microphones": mic}),
+    );
     Ok(())
 }
 
@@ -787,6 +966,24 @@ fn status(c: &Ctx) -> Result<()> {
             if !rules.is_empty() {
                 s += &format!("\nActive rules: {}\n", rules.join(", "));
             }
+            let mics: Vec<&AudioDevice> = c
+                .mics
+                .iter()
+                .filter(|d| d.active && (d.default || eff.mic(&d.id).is_some()))
+                .collect();
+            if !mics.is_empty() {
+                s += &format!("\nMicrophones  {}\n", if eff.mic_bypass { "○ bypassed" } else { "● on" });
+                for d in mics {
+                    let (desc, r) = chain_summary(&eff, eff.chain(&Target::Mic(d.id.clone())));
+                    s += &format!(
+                        "{} {:<34} {desc:<34} preamp {}{}\n",
+                        if d.default { "▸" } else { " " },
+                        d.label(),
+                        dsp::fmt_db(r.preamp),
+                        if d.apo { "" } else { "  (EQ not enabled there)" }
+                    );
+                }
+            }
             s
         },
         || {
@@ -801,6 +998,12 @@ fn status(c: &Ctx) -> Result<()> {
                     json!({"name": n, "summary": desc, "profile": ch.profile, "correction": ch.correction.as_ref().map(|c| &c.name), "strength": ch.strength, "preamp": r.preamp, "peak": r.peak})
                 }).collect::<Vec<_>>(),
                 "active_rules": rules,
+                "microphones_enabled": !eff.mic_bypass,
+                "microphones": c.mics.iter().filter(|d| d.active).map(|d| {
+                    let ch = eff.chain(&Target::Mic(d.id.clone()));
+                    let (desc, r) = chain_summary(&eff, ch);
+                    json!({"id": d.id, "name": d.label(), "default": d.default, "apo": d.apo, "summary": desc, "profile": ch.profile, "correction": ch.correction.as_ref().map(|c| &c.name), "strength": ch.strength, "preamp": r.preamp})
+                }).collect::<Vec<_>>(),
             })
         },
     );
@@ -901,6 +1104,7 @@ fn profile_cmd(c: &mut Ctx, cmd: ProfileCmd) -> Result<()> {
                 name: name.clone(),
                 tone: Tone::default(),
                 bands: vec![],
+                mic: c.mic.is_some(),
             });
             format!("created '{name}'")
         }
@@ -935,7 +1139,7 @@ fn profile_cmd(c: &mut Ctx, cmd: ProfileCmd) -> Result<()> {
 fn autoeq_cmd(c: &mut Ctx, cmd: AutoEqCmd) -> Result<()> {
     match cmd {
         AutoEqCmd::Search { query, limit } => {
-            let idx = autoeq::load_index(false)?;
+            let idx = autoeq::load_index(autoeq::CLI_MAX_AGE)?;
             let hits = autoeq::search(&idx, &query.join(" "), limit);
             c.print(
                 || {
@@ -963,7 +1167,7 @@ fn autoeq_cmd(c: &mut Ctx, cmd: AutoEqCmd) -> Result<()> {
             device,
             strength,
         } => {
-            let idx = autoeq::load_index(false)?;
+            let idx = autoeq::load_index(autoeq::CLI_MAX_AGE)?;
             let q = query.join(" ");
             let hits = autoeq::search(&idx, &q, 50);
             let e = match pick {
@@ -1002,7 +1206,7 @@ fn autoeq_cmd(c: &mut Ctx, cmd: AutoEqCmd) -> Result<()> {
             Ok(())
         }
         AutoEqCmd::Suggest => {
-            let idx = autoeq::load_index(false)?;
+            let idx = autoeq::load_index(autoeq::CLI_MAX_AGE)?;
             let found: Vec<(String, String)> = c
                 .devices
                 .iter()
@@ -1021,8 +1225,211 @@ fn autoeq_cmd(c: &mut Ctx, cmd: AutoEqCmd) -> Result<()> {
             Ok(())
         }
         AutoEqCmd::Refresh => {
-            let n = autoeq::load_index(true)?.len();
+            let n = autoeq::load_index(std::time::Duration::ZERO)?.len();
             c.print(|| format!("AutoEq index: {n} profiles"), || json!({"profiles": n}));
+            Ok(())
+        }
+    }
+}
+
+fn mic_cmd(c: &mut Ctx, cmd: MicCmd) -> Result<()> {
+    // The microphone a subcommand is about: -d, else --mic, else the default input.
+    let which = |c: &Ctx, device: Option<String>| device.or(c.mic.clone()).unwrap_or_else(|| "default".into());
+    match cmd {
+        MicCmd::List => {
+            c.print(
+                || {
+                    let mut s = String::new();
+                    for d in &c.mics {
+                        s += &format!(
+                            "{} {:<46} {:<9} {} {}\n",
+                            if d.default { "▸" } else { " " },
+                            d.label(),
+                            if d.active { "active" } else { "unplugged" },
+                            if d.apo { "APO ✓" } else { "APO ✗" },
+                            d.id
+                        );
+                    }
+                    if s.is_empty() { "no microphones found".into() } else { s }
+                },
+                || {
+                    json!(
+                        c.mics
+                            .iter()
+                            .map(|d| json!({"id": d.id, "name": d.label(), "active": d.active, "default": d.default, "apo": d.apo}))
+                            .collect::<Vec<_>>()
+                    )
+                },
+            );
+            Ok(())
+        }
+        MicCmd::Search { query, limit } => {
+            let lib = miclib::load(autoeq::CLI_MAX_AGE);
+            let hits = miclib::search(&lib, &query.join(" "), limit);
+            c.print(
+                || {
+                    hits.iter()
+                        .enumerate()
+                        .map(|(i, m)| format!("{:>3}  {:<36} {}\n", i + 1, m.name, m.kind))
+                        .collect()
+                },
+                || {
+                    json!(
+                        hits.iter()
+                            .map(|m| json!({"name": m.name, "type": m.kind, "generic": m.generic, "note": m.note}))
+                            .collect::<Vec<_>>()
+                    )
+                },
+            );
+            if hits.is_empty() && !c.json {
+                eprintln!("no matches (try `eqx mic search generic` for a starting point)");
+            }
+            Ok(())
+        }
+        MicCmd::Apply {
+            query,
+            pick,
+            device,
+            strength,
+        } => {
+            let lib = miclib::load(autoeq::CLI_MAX_AGE);
+            let q = query.join(" ");
+            if q.trim().is_empty() {
+                bail!("name the microphone model, e.g. `eqx mic apply sm7b` (see `eqx mic search`)");
+            }
+            let hits = miclib::search(&lib, &q, 50);
+            let m = match pick {
+                Some(n) => hits
+                    .get(n.saturating_sub(1))
+                    .ok_or_else(|| anyhow!("--pick {n}: only {} results", hits.len()))?,
+                None => hits.first().ok_or_else(|| anyhow!("no microphone in the library matches '{q}'"))?,
+            };
+            let cor = m.correction();
+            let t = c.mic_target(&which(c, device), true)?;
+            let ch = c.state.chain_mut(&t);
+            ch.correction = Some(cor.clone());
+            if let Some(s) = strength {
+                ch.strength = (s / 100.0).clamp(0.0, 1.5);
+            }
+            c.commit()?;
+            c.print(
+                || format!("{} ({}) → {}, {} filters", cor.name, m.kind, c.target_name(&t), cor.filters.len()),
+                || json!({"name": cor.name, "source": cor.source, "filters": cor.filters.len(), "target": c.target_name(&t)}),
+            );
+            Ok(())
+        }
+        MicCmd::Clear { device } => {
+            let t = c.mic_target(&which(c, device), true)?;
+            c.state.chain_mut(&t).correction = None;
+            c.commit()?;
+            c.print(|| format!("correction removed from {}", c.target_name(&t)), || json!({"ok": true}));
+            Ok(())
+        }
+        MicCmd::Suggest => {
+            let lib = miclib::load(autoeq::CLI_MAX_AGE);
+            let found: Vec<(String, String)> = c
+                .mics
+                .iter()
+                .filter_map(|d| miclib::suggest(&lib, &d.label()).map(|m| (d.label(), m.name.clone())))
+                .collect();
+            c.print(
+                || {
+                    if found.is_empty() {
+                        "no microphone models recognised in device names (XLR microphones show up as their interface: search by model)"
+                            .into()
+                    } else {
+                        found.iter().map(|(d, m)| format!("{d}  →  {m}\n")).collect()
+                    }
+                },
+                || json!(found.iter().map(|(d, m)| json!({"device": d, "match": m})).collect::<Vec<_>>()),
+            );
+            Ok(())
+        }
+        MicCmd::Refresh => {
+            let fresh = miclib::refresh();
+            let lib = miclib::cached();
+            if let Err(e) = &fresh {
+                eprintln!("warning: {e:#}; using the saved list");
+            }
+            c.print(
+                || format!("microphone library: {} microphones, updated {}", lib.mics.len(), lib.updated),
+                || json!({"microphones": lib.mics.len(), "updated": lib.updated, "online": fresh.is_ok()}),
+            );
+            Ok(())
+        }
+        MicCmd::Fix { device } => {
+            let t = c.mic_target(&which(c, device), false)?;
+            let Target::Mic(id) = &t else { unreachable!() };
+            let pack = equinox::enhance::pack_name(id, true);
+            let changed = equinox::enhance::fix(id, true).map_err(|e| anyhow!(e))?;
+            c.print(
+                || {
+                    if changed {
+                        format!(
+                            "{pack} was replacing the EQ on {}; switched it to its own effects",
+                            c.target_name(&t)
+                        )
+                    } else {
+                        format!("nothing in the way on {}", c.target_name(&t))
+                    }
+                },
+                || json!({"changed": changed}),
+            );
+            Ok(())
+        }
+        MicCmd::Check { device, seconds } => {
+            let t = c.mic_target(&which(c, device), false)?;
+            let Target::Mic(id) = &t else { unreachable!() };
+            eprintln!("Listening to {} for {seconds:.0} s…", c.target_name(&t));
+            let check = equinox::miccheck::run_for(&c.state, id, seconds).map_err(|e| anyhow!(e))?;
+            let verdict = match check.applied() {
+                Some(true) => "The EQ is reaching this microphone.".to_string(),
+                Some(false) if equinox::enhance::overridden(id, true) => format!(
+                    "The EQ is NOT reaching this microphone: {} is running in its place. `eqx mic fix` switches it off.",
+                    equinox::enhance::pack_name(id, true)
+                ),
+                Some(false) if !c.mics.iter().any(|d| &d.id == id && d.apo) => {
+                    "The EQ is NOT reaching this microphone: EQ isn't enabled on it (`eqx apo enable --mic default`).".to_string()
+                }
+                Some(false) => "The EQ is NOT reaching this microphone: its signal doesn't follow the EQ.".to_string(),
+                None => "The EQ is too close to flat right now to tell; pick a preset and run this again.".to_string(),
+            };
+            c.print(
+                || {
+                    let mut s = String::from("    band   measured   expected\n");
+                    for (f, m, e) in &check.bands {
+                        s += &format!("{:>8}  {:>8}   {:>8}\n", dsp::fmt_freq(*f), dsp::fmt_db(*m), dsp::fmt_db(*e));
+                    }
+                    s + "\n" + &verdict
+                },
+                || json!({"applied": check.applied(), "measured": check.measured, "expected": check.expected, "bands": check.bands.iter().map(|(f, m, e)| json!({"hz": f, "measured": m, "expected": e})).collect::<Vec<_>>()}),
+            );
+            Ok(())
+        }
+        MicCmd::Monitor { device, volume, seconds } => {
+            let t = c.mic_target(&which(c, device), false)?;
+            let Target::Mic(id) = &t else { unreachable!() };
+            let out = c
+                .devices
+                .iter()
+                .find(|d| d.default)
+                .map(|d| d.label())
+                .unwrap_or_else(|| "the default output".into());
+            let mon = equinox::monitor::Monitor::start(id, (volume / 100.0).clamp(0.0, 2.0));
+            eprintln!("Playing {} through {out}. Use headphones, or it will feed back.", c.target_name(&t));
+            match seconds {
+                Some(s) => std::thread::sleep(std::time::Duration::from_secs_f32(s.clamp(0.1, 3600.0))),
+                None => {
+                    eprintln!("Press Enter to stop.");
+                    let _ = std::io::stdin().read_line(&mut String::new());
+                }
+            }
+            let (frames, err) = (mon.frames(), mon.error());
+            drop(mon);
+            if let Some(e) = err {
+                bail!(e);
+            }
+            c.print(|| "stopped".into(), || json!({"frames": frames}));
             Ok(())
         }
     }
@@ -1097,7 +1504,7 @@ pub fn rule_text(s: &State, devices: &[AudioDevice], r: &equinox::model::Rule) -
             .iter()
             .find(|d| d.id == id)
             .map(|d| d.label())
-            .or_else(|| s.device(id).map(|d| d.name.clone()))
+            .or_else(|| s.device(id).or(s.mic(id)).map(|d| d.name.clone()))
             .unwrap_or_else(|| id.to_string())
     };
     let when = match &r.trigger {
@@ -1107,7 +1514,7 @@ pub fn rule_text(s: &State, devices: &[AudioDevice], r: &equinox::model::Rule) -
     };
     let target = |t: &Target| match t {
         Target::Global => "all devices".to_string(),
-        Target::Device(id) => dev_name(id),
+        Target::Device(id) | Target::Mic(id) => dev_name(id),
     };
     let what = match &r.action {
         Action::UseProfile { target: t, profile } => {
@@ -1149,7 +1556,7 @@ fn apo_cmd(c: &Ctx, cmd: ApoCmd) -> Result<()> {
     match cmd {
         ApoCmd::Status => {
             let foreign = a.foreign_lines();
-            let on: Vec<&AudioDevice> = c.devices.iter().filter(|d| d.apo).collect();
+            let on: Vec<&AudioDevice> = c.devices.iter().chain(&c.mics).filter(|d| d.apo).collect();
             c.print(
                 || {
                     let mut s = format!("Equalizer APO {}  ({})\n", a.version, a.install.display());
@@ -1183,7 +1590,7 @@ fn apo_cmd(c: &Ctx, cmd: ApoCmd) -> Result<()> {
                 bail!("couldn't start {}", a.device_selector().display());
             }
         }
-        ApoCmd::Enable { devices } | ApoCmd::Disable { devices } if devices.is_empty() => {
+        ApoCmd::Enable { devices } | ApoCmd::Disable { devices } if devices.is_empty() && c.mic.is_none() => {
             let _ = devices;
             bail!("name the device(s), e.g. `eqx apo enable default` (see `eqx devices`)");
         }
@@ -1194,9 +1601,16 @@ fn apo_cmd(c: &Ctx, cmd: ApoCmd) -> Result<()> {
 }
 
 fn apo_setup_cmd(c: &Ctx, names: &[String], enable: bool) -> Result<()> {
+    // Outputs first, then microphones ("default" is the default output; --mic picks a microphone).
     let mut ids = Vec::new();
+    if let Some(m) = &c.mic {
+        let d = devices::find(&c.mics, m).ok_or_else(|| anyhow!("no microphone matches '{m}' (see `eqx mic list`)"))?;
+        ids.push(d.id.clone());
+    }
     for n in names {
-        let d = devices::find(&c.devices, n).ok_or_else(|| anyhow!("no output device matches '{n}'"))?;
+        let d = devices::find(&c.devices, n)
+            .or_else(|| devices::find(&c.mics, n))
+            .ok_or_else(|| anyhow!("no output or microphone matches '{n}' (see `eqx devices`, `eqx mic list`)"))?;
         ids.push(d.id.clone());
     }
     eprintln!("Approve the Windows prompt; sound restarts for a moment…");
@@ -1213,6 +1627,7 @@ fn apo_setup_cmd(c: &Ctx, names: &[String], enable: bool) -> Result<()> {
                 let name = c
                     .devices
                     .iter()
+                    .chain(&c.mics)
                     .find(|x| x.id == d.guid)
                     .map(|x| x.label())
                     .unwrap_or_else(|| d.guid.clone());

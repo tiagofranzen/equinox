@@ -120,34 +120,62 @@ pub fn resolve(state: &State, chain: &Chain) -> Resolved {
     }
 }
 
+/// The config has two halves. Equalizer APO loads the same file for outputs
+/// and for microphones and tells them apart by stage: outputs run `post-mix`
+/// (its default for them), microphones `capture`. Each microphone also gets
+/// its own `Device:` line. `devices` are the outputs (microphones are
+/// addressed by the GUIDs saved in the state, plugged in or not).
+///
+/// Equalizer APO checks `Device:` before `Stage:`, and hides every line after
+/// a `Device:` that doesn't match. So the microphone half starts with
+/// `Device: all`: without it, the `Stage: capture` line would be invisible to
+/// any endpoint the last output section didn't name.
 pub fn render(state: &State, devices: &[AudioDevice]) -> String {
     let mut s = String::from("# Written by equinox. Changes here are overwritten: use the app or `eqx`.\n");
+    s.push_str("\n# Outputs\nStage: post-mix\n");
     if state.bypass {
         s.push_str("# Bypassed\n");
     }
     match state.mode {
-        Mode::Global => emit(&mut s, state, &state.global),
+        Mode::Global => emit(&mut s, state, &state.global, state.bypass),
         Mode::PerDevice => {
             // Devices with their own chain get a section each; the rest share one.
             let (own, follow): (Vec<&AudioDevice>, Vec<&AudioDevice>) =
                 devices.iter().partition(|d| state.owns_chain(&Target::Device(d.id.clone())));
             for d in own {
                 s.push_str(&format!("\n# {}\nDevice: {}\n", d.label(), d.id));
-                emit(&mut s, state, state.chain(&Target::Device(d.id.clone())));
+                emit(&mut s, state, state.chain(&Target::Device(d.id.clone())), state.bypass);
             }
             if !follow.is_empty() {
                 let ids: Vec<&str> = follow.iter().map(|d| d.id.as_str()).collect();
                 s.push_str(&format!("\n# Every other device\nDevice: {}\n", ids.join("; ")));
-                emit(&mut s, state, &state.global);
+                emit(&mut s, state, &state.global, state.bypass);
             }
         }
+    }
+
+    let mut mics = String::new();
+    for m in &state.mics {
+        let mut body = String::new();
+        emit(&mut body, state, &m.chain, state.mic_bypass);
+        if !body.is_empty() {
+            let name = if m.name.is_empty() { "Microphone" } else { &m.name };
+            mics.push_str(&format!("\n# {name}\nDevice: {}\n{body}", m.id));
+        }
+    }
+    if !mics.is_empty() {
+        s.push_str("\n# Microphones\nDevice: all\nStage: capture\n");
+        if state.mic_bypass {
+            s.push_str("# Bypassed\n");
+        }
+        s.push_str(&mics);
     }
     s
 }
 
-fn emit(s: &mut String, state: &State, chain: &Chain) {
+fn emit(s: &mut String, state: &State, chain: &Chain, bypass: bool) {
     let r = resolve(state, chain);
-    if state.bypass {
+    if bypass {
         // Level-matched bypass keeps the gain change so A/B isn't won by loudness.
         if state.settings.level_matched_bypass && r.preamp.abs() >= 0.05 {
             s.push_str(&format!("Preamp: {:.1} dB\n", r.preamp));
@@ -220,7 +248,67 @@ mod tests {
             form: crate::devices::Form::Headphones,
             apo: true,
             default: true,
+            capture: false,
         }
+    }
+
+    #[test]
+    fn microphones_render_in_the_capture_stage() {
+        let mut s = State::default();
+        let text = render(&s, &[]);
+        assert!(!text.contains("Stage: capture"), "no microphone set up yet: {text}");
+        assert!(text.contains("Stage: post-mix"), "outputs never run on microphones: {text}");
+
+        let mic = Target::Mic("{mic}".into());
+        s.mic_mut("{mic}", "Microphone (Test)");
+        assert!(!render(&s, &[]).contains("Stage: capture"), "a flat microphone writes nothing");
+        s.chain_mut(&mic).profile = s.find_profile_in("voice clarity", Some(true));
+        let text = render(&s, &[]);
+        let (out, cap) = text.split_once("Stage: capture").expect("capture section");
+        assert!(
+            out.trim_end().ends_with("Device: all"),
+            "the stage line must be visible to every endpoint: {text}"
+        );
+        assert!(cap.contains("Device: {mic}"), "{text}");
+        assert!(cap.contains("HPQ Fc 80.0 Hz"), "{text}");
+        assert!(!out.contains("HPQ Fc 80.0 Hz"), "{text}");
+
+        // Per-device outputs end on a Device line that excludes the microphone;
+        // the reset has to come after it.
+        let mut per = s.clone();
+        per.detach_device("{abc}", "Headphones");
+        let text = render(&per, &[dev("{abc}")]);
+        let reset = text.find("Device: all").expect("reset");
+        assert!(
+            text.find("Device: {abc}").unwrap() < reset && reset < text.find("Stage: capture").unwrap(),
+            "{text}"
+        );
+
+        // The two bypasses are independent.
+        s.bypass = true;
+        assert!(render(&s, &[]).contains("HPQ Fc 80.0 Hz"));
+        s.bypass = false;
+        s.mic_bypass = true;
+        let text = render(&s, &[]);
+        assert!(!text.contains("HPQ"), "{text}");
+    }
+
+    #[test]
+    fn microphone_profiles_are_kept_apart() {
+        let s = State::default();
+        assert!(s.profiles_for(true).count() >= 5);
+        assert!(s.profiles_for(false).all(|p| !p.mic));
+        assert_eq!(s.chain(&Target::Mic("{nope}".into())), &Chain::FLAT);
+        // A state file from before microphones gets the starter mic profiles once.
+        let mut old = State::default();
+        old.profiles.retain(|p| !p.mic);
+        old.mic_presets = false;
+        let n = old.profiles.len();
+        old.seed_mic_presets();
+        assert!(old.profiles.len() > n);
+        let again = old.profiles.len();
+        old.seed_mic_presets();
+        assert_eq!(old.profiles.len(), again);
     }
 
     #[test]

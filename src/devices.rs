@@ -1,13 +1,19 @@
-//! Output devices, read straight from the MMDevices registry (fast, no COM,
+//! Audio endpoints, read straight from the MMDevices registry (fast, no COM,
 //! and it includes unplugged endpoints so per-device settings survive replugs).
+//! Outputs and microphones are the same kind of entry in two registry branches.
 
 use winreg::RegKey;
 use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ};
 
-const RENDER: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Render";
+const AUDIO: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio";
 const P_NAME: &str = "{a45c254e-df1c-4efd-8020-67d146a850e0},2";
 const P_IFACE: &str = "{b3f8fa53-0004-438e-9003-51a46e139bfc},6";
 const P_FORM: &str = "{1da5d803-d492-4edd-8c23-e0c0ffee7f0e},0";
+
+/// Registry path of an endpoint branch: outputs (`Render`) or inputs (`Capture`).
+pub fn branch(capture: bool) -> String {
+    format!(r"{AUDIO}\{}", if capture { "Capture" } else { "Render" })
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Form {
@@ -16,6 +22,8 @@ pub enum Form {
     Headset,
     Digital,
     Display,
+    Microphone,
+    Line,
     Other,
 }
 
@@ -23,7 +31,9 @@ impl Form {
     fn from_reg(v: u32) -> Form {
         match v {
             1 => Form::Speakers,
+            2 => Form::Line,
             3 => Form::Headphones,
+            4 => Form::Microphone,
             5 | 6 => Form::Headset,
             7 | 8 => Form::Digital,
             9 => Form::Display,
@@ -36,6 +46,7 @@ impl Form {
             Form::Headphones | Form::Headset => "🎧",
             Form::Speakers => "🔊",
             Form::Display => "🖵",
+            Form::Microphone => "🎤",
             _ => "♪",
         }
     }
@@ -50,15 +61,17 @@ impl Form {
 pub struct AudioDevice {
     /// Endpoint GUID, lowercase with braces.
     pub id: String,
-    /// "Headphones", "Speakers"...
+    /// "Headphones", "Speakers", "Microphone"...
     pub name: String,
-    /// Adapter or product: "Realtek(R) Audio", "WH-1000XM4".
+    /// Adapter or product: "Realtek(R) Audio", "WH-1000XM4", "HyperX SoloCast".
     pub interface: String,
     pub active: bool,
     pub form: Form,
     /// Equalizer APO is installed on this endpoint.
     pub apo: bool,
     pub default: bool,
+    /// An input (microphone, line in) rather than an output.
+    pub capture: bool,
 }
 
 impl AudioDevice {
@@ -77,6 +90,10 @@ impl AudioDevice {
             "speakers",
             "headset",
             "headset earphone",
+            "headset microphone",
+            "microphone",
+            "microphone array",
+            "line in",
             "digital output",
             "realtek digital output",
         ];
@@ -92,18 +109,35 @@ impl AudioDevice {
 /// Active and unplugged outputs (disabled and removed ones are skipped),
 /// default first, then active, then by name.
 pub fn list() -> Vec<AudioDevice> {
+    read(false)
+}
+
+/// Active and unplugged inputs, in the same order as [`list`].
+pub fn list_capture() -> Vec<AudioDevice> {
+    read(true)
+}
+
+fn read(capture: bool) -> Vec<AudioDevice> {
     let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
-    let Ok(render) = hklm.open_subkey_with_flags(RENDER, KEY_READ) else {
+    let Ok(root) = hklm.open_subkey_with_flags(branch(capture), KEY_READ) else {
         return Vec::new();
     };
     let apo = crate::apo::installed_endpoints();
-    let default = crate::sys::default_output();
+    let default = if capture {
+        crate::sys::default_input()
+    } else {
+        crate::sys::default_output()
+    };
     let mut out = Vec::new();
-    for guid in render.enum_keys().flatten() {
-        let Ok(key) = render.open_subkey_with_flags(&guid, KEY_READ) else {
+    for guid in root.enum_keys().flatten() {
+        let Ok(key) = root.open_subkey_with_flags(&guid, KEY_READ) else {
             continue;
         };
         let state: u32 = key.get_value("DeviceState").unwrap_or(0);
+        // Devices turned off in Sound settings keep their plugged state and gain this flag.
+        if state & 0x1000_0000 != 0 {
+            continue;
+        }
         let active = match state & 0xF {
             1 => true,
             8 => false,
@@ -125,6 +159,7 @@ pub fn list() -> Vec<AudioDevice> {
             active,
             name,
             id,
+            capture,
         });
     }
     out.sort_by(|a, b| {

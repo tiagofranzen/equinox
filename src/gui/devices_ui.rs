@@ -1,4 +1,4 @@
-//! "Where should equinox work?": a Windows 11-style output picker that installs
+//! "Where should equinox work?": a Windows 11-style picker of outputs and microphones that installs
 //! Equalizer APO on the chosen devices (one UAC prompt) and shows whether it
 //! verifiably works, replacing Equalizer APO's Device Selector.
 
@@ -26,7 +26,7 @@ pub struct Picker {
 
 impl App {
     pub fn open_picker(&mut self, preselect: Option<String>) {
-        self.picker.want = self.devices.iter().filter(|d| d.apo).map(|d| d.id.clone()).collect();
+        self.picker.want = self.all_devices().filter(|d| d.apo).map(|d| d.id.clone()).collect();
         self.picker.want.extend(preselect);
         self.picker.result = None;
         self.picker.open = true;
@@ -87,6 +87,7 @@ impl App {
         let Ok(r) = rx.try_recv() else { return };
         self.picker.job = None;
         self.devices = equinox::devices::list();
+        self.mics = equinox::devices::list_capture();
         self.refresh_apo();
         if let Ok(rep) = &r {
             let ok = rep.devices.iter().any(|d| d.installed);
@@ -135,19 +136,16 @@ impl App {
     fn picker_list(&mut self, ui: &mut Ui, ctx: &egui::Context) {
         heading(ui, "Where should equinox work?");
         ui.label(
-            RichText::new("Turn on the outputs you want to EQ. You'll get one Windows admin prompt, and sound cuts out for a second while it applies.")
+            RichText::new("Turn on the outputs and microphones you want to EQ. You'll get one Windows admin prompt, and sound cuts out for a second while it applies.")
                 .size(12.5)
                 .color(DIM),
         );
         ui.add_space(12.0);
 
-        let active: Vec<_> = self.devices.iter().filter(|d| d.active).cloned().collect();
-        let unplugged: Vec<_> = self.devices.iter().filter(|d| !d.active).cloned().collect();
-        let shown: Vec<_> = if self.picker.show_unplugged {
-            active.iter().chain(&unplugged).cloned().collect()
-        } else {
-            active.clone()
-        };
+        // Outputs first, then microphones; unplugged ones only on request.
+        let unplugged = self.all_devices().filter(|d| !d.active).count();
+        let show_unplugged = self.picker.show_unplugged;
+        let shown: Vec<_> = self.all_devices().filter(|d| d.active || show_unplugged).cloned().collect();
 
         egui::Frame::new()
             .fill(Color32::from_rgb(12, 12, 14))
@@ -160,6 +158,19 @@ impl App {
                     .show(ui, |ui| {
                         ui.spacing_mut().item_spacing.y = 0.0;
                         for (i, d) in shown.iter().enumerate() {
+                            // A label where the outputs end and the microphones begin.
+                            let first_of_kind = i == 0 || shown[i - 1].capture != d.capture;
+                            if first_of_kind {
+                                let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::hover());
+                                ui.painter().rect_filled(r, 0.0, Color32::from_rgb(16, 16, 18));
+                                ui.painter().text(
+                                    pos2(r.left() + 16.0, r.center().y),
+                                    egui::Align2::LEFT_CENTER,
+                                    if d.capture { "MICROPHONES" } else { "OUTPUTS" },
+                                    egui::FontId::proportional(10.5),
+                                    DIM,
+                                );
+                            }
                             let on = self.picker.want.contains(&d.id);
                             let h = 64.0;
                             let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), h), Sense::click());
@@ -167,7 +178,7 @@ impl App {
                             if resp.hovered() {
                                 p.rect_filled(rect, 0.0, Color32::from_rgb(20, 20, 23));
                             }
-                            if i > 0 {
+                            if !first_of_kind {
                                 p.line_segment(
                                     [pos2(rect.left() + 16.0, rect.top()), pos2(rect.right() - 16.0, rect.top())],
                                     Stroke::new(1.0, LINE),
@@ -249,16 +260,16 @@ impl App {
                         }
                         if shown.is_empty() {
                             ui.add_space(20.0);
-                            ui.label(RichText::new("No outputs found.").color(DIM));
+                            ui.label(RichText::new("No devices found.").color(DIM));
                         }
                     });
             });
-        if !unplugged.is_empty() {
+        if unplugged > 0 {
             ui.add_space(6.0);
             let t = if self.picker.show_unplugged {
                 "Hide unplugged devices".to_string()
             } else {
-                format!("Show {} unplugged device(s)", unplugged.len())
+                format!("Show {unplugged} unplugged device(s)")
             };
             if flat(ui, RichText::new(t).size(12.0).color(DIM)).clicked() {
                 self.picker.show_unplugged = !self.picker.show_unplugged;
@@ -266,14 +277,12 @@ impl App {
         }
 
         let install: Vec<String> = self
-            .devices
-            .iter()
+            .all_devices()
             .filter(|d| !d.apo && self.picker.want.contains(&d.id))
             .map(|d| d.id.clone())
             .collect();
         let remove: Vec<String> = self
-            .devices
-            .iter()
+            .all_devices()
             .filter(|d| d.apo && !self.picker.want.contains(&d.id))
             .map(|d| d.id.clone())
             .collect();
@@ -380,6 +389,9 @@ impl App {
                         ui.vertical(|ui| {
                             ui.label(RichText::new(name).color(WHITE));
                             ui.label(RichText::new(text).size(12.0).color(DIM));
+                            if !d.note.is_empty() {
+                                ui.label(RichText::new(&d.note).size(12.0).color(DIM));
+                            }
                         });
                     });
                     ui.add_space(4.0);

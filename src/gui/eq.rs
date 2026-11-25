@@ -1,11 +1,13 @@
-//! Equalizer page: device targets, smart banners, graph, simple/advanced
-//! controls, headphone correction and output cards, AutoEq browser.
+//! Equalizer and Microphone pages (one editor, pointed at an output or at a
+//! microphone): device targets, smart banners, graph, simple/advanced controls,
+//! correction and level cards, and the AutoEq and microphone library browsers.
 
 use eframe::egui::{self, Align, Color32, Layout, RichText, Sense, Stroke, Ui, vec2};
 use equinox::dsp::fmt_db;
 use equinox::engine;
 use equinox::eqtext;
 use equinox::model::{Action, Band, Correction, FilterKind, Mode, Profile, Target, Tone};
+use equinox::monitor::Monitor;
 
 use super::App;
 use super::theme::*;
@@ -19,20 +21,35 @@ enum Banner {
     Rule(u64),
     Following(String),
     Suggest(String, equinox::autoeq::Entry),
+    SuggestMic(String, equinox::miclib::Mic),
+    /// A newer release is out.
+    Update(equinox::update::Release),
+    UpdateProgress(String, f32),
+    /// Windows Voice Clarity is running on this microphone instead of the EQ.
+    Enhancement(String, String),
 }
 
 impl App {
     pub fn eq_page(&mut self, ui: &mut Ui) {
+        let mic = self.page == super::Page::Mic;
+        if mic && !self.target.is_mic() {
+            return self.no_microphones(ui);
+        }
         // Keep the selected target meaningful for the current mode.
-        if self.st.mode == Mode::Global {
+        if !mic && self.st.mode == Mode::Global {
             self.target = Target::Global;
         }
-        self.target_row(ui);
+        if mic {
+            self.mic_row(ui);
+        } else {
+            self.target_row(ui);
+        }
         ui.add_space(8.0);
         self.banners(ui);
 
         let avail = ui.available_height();
-        let graph_h = (avail - 318.0).clamp(220.0, 560.0);
+        // The microphone's Input card has two more rows than the Output card.
+        let graph_h = (avail - if mic { 336.0 } else { 318.0 }).clamp(220.0, 560.0);
         self.graph(ui, graph_h);
         ui.add_space(12.0);
 
@@ -51,12 +68,120 @@ impl App {
                     .id_salt("rightcol")
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        self.headphone_card(ui);
+                        self.correction_card(ui);
                         ui.add_space(8.0);
                         self.output_card(ui);
                     });
             });
         });
+    }
+
+    fn no_microphones(&mut self, ui: &mut Ui) {
+        ui.add_space(60.0);
+        ui.vertical_centered(|ui| {
+            heading(ui, "No microphone found");
+            ui.add_space(6.0);
+            ui.label(RichText::new("Plug one in, or turn it on in Windows Sound settings, and it will show up here.").color(DIM));
+        });
+    }
+
+    /// Microphone chips on the left, "Hear yourself" on the right.
+    fn mic_row(&mut self, ui: &mut Ui) {
+        let Target::Mic(sel) = self.target.clone() else { return };
+        ui.horizontal(|ui| {
+            let listening = self.monitor.is_some();
+            let button_w = if listening { 300.0 } else { 170.0 };
+            let chips_w = (ui.available_width() - button_w - 12.0).max(120.0);
+            egui::ScrollArea::horizontal()
+                .id_salt("mics")
+                .max_width(chips_w)
+                .auto_shrink([false, true])
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        // Plugged-in microphones, plus set-up ones and the one being shown.
+                        let shown: Vec<_> = self
+                            .mics
+                            .iter()
+                            .filter(|d| d.active || d.id == sel || self.st.mic(&d.id).is_some_and(|m| m.chain != equinox::model::Chain::FLAT))
+                            .cloned()
+                            .collect();
+                        for d in &shown {
+                            let shaped = self.st.mic(&d.id).is_some_and(|m| m.chain != equinox::model::Chain::FLAT);
+                            let dot = if !d.apo {
+                                WARN
+                            } else if shaped {
+                                self.accent
+                            } else {
+                                DIM
+                            };
+                            let label = format!("{}{}", if d.default { "▸ " } else { "" }, d.short());
+                            let mut tip = d.label();
+                            if d.default {
+                                tip += "\nDefault microphone";
+                            }
+                            tip += if shaped { "\nHas its own EQ" } else { "\nNo EQ yet" };
+                            if !d.apo {
+                                tip += "\nEqualizer APO not installed on this microphone";
+                            }
+                            if !d.active {
+                                tip += "\nUnplugged";
+                            }
+                            if chip(ui, d.id == sel, self.accent, &label, Some(dot)).on_hover_text(tip).clicked() {
+                                self.mic_sel = Some(d.id.clone());
+                                self.sel_band = None;
+                            }
+                        }
+                        let others: Vec<_> = self.mics.iter().filter(|d| !shown.iter().any(|s| s.id == d.id)).cloned().collect();
+                        if !others.is_empty() {
+                            egui::ComboBox::from_id_salt("more-mics")
+                                .selected_text(RichText::new(format!("+{} unplugged", others.len())).color(DIM))
+                                .width(130.0)
+                                .show_ui(ui, |ui| {
+                                    for d in others {
+                                        if ui.selectable_label(false, d.label()).clicked() {
+                                            self.mic_sel = Some(d.id.clone());
+                                        }
+                                    }
+                                });
+                        }
+                    });
+                });
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let label = if listening { "■  Stop listening" } else { "🎧  Hear yourself" };
+                let text = RichText::new(label).size(13.0).family(semibold());
+                let button = if listening {
+                    egui::Button::new(text.color(Color32::BLACK)).fill(self.accent)
+                } else {
+                    egui::Button::new(text.color(WHITE)).fill(RAISED).stroke(Stroke::new(1.0, FAINT))
+                };
+                let resp = ui
+                    .add(button.corner_radius(99).min_size(vec2(0.0, 30.0)))
+                    .on_hover_text("Plays this microphone, EQ included, through your default output so you hear what others will.\nUse headphones: speakers feed back into the microphone.");
+                if resp.clicked() {
+                    self.monitor = if listening {
+                        None
+                    } else {
+                        Some(Monitor::start(&sel, self.st.settings.monitor_volume))
+                    };
+                }
+                if let Some(m) = &self.monitor {
+                    // Level meter: green, amber close to full scale.
+                    let (r, _) = ui.allocate_exact_size(vec2(110.0, 6.0), Sense::hover());
+                    ui.painter().rect_filled(r, 3.0, Color32::from_rgb(24, 24, 27));
+                    let db = 20.0 * self.mic_level.max(1e-5).log10();
+                    let t = ((db + 60.0) / 60.0).clamp(0.0, 1.0);
+                    let fill = egui::Rect::from_min_size(r.min, vec2(r.width() * t, r.height()));
+                    ui.painter().rect_filled(fill, 3.0, if db > -3.0 { WARN } else { GOOD });
+                    if let Some(e) = m.error() {
+                        ui.label(RichText::new("!").color(BAD)).on_hover_text(e);
+                    }
+                }
+            });
+        });
+        if let Some(e) = self.monitor.as_ref().and_then(|m| m.error()) {
+            ui.label(RichText::new(e).size(11.5).color(BAD));
+        }
     }
 
     fn target_row(&mut self, ui: &mut Ui) {
@@ -171,8 +296,14 @@ impl App {
 
     fn banners(&mut self, ui: &mut Ui) {
         let mut list = Vec::new();
+        let mic = self.target.is_mic();
+        match &self.update {
+            super::UpdateState::Available(r) if !self.update_snoozed => list.push(Banner::Update(r.clone())),
+            super::UpdateState::Downloading(r, p) => list.push(Banner::UpdateProgress(r.version.clone(), *p)),
+            _ => {}
+        }
         let focus_dev = match &self.target {
-            Target::Device(id) => self.device(id).cloned(),
+            Target::Device(id) | Target::Mic(id) => self.device(id).cloned(),
             Target::Global => self.devices.iter().find(|d| d.default).cloned(),
         };
         let missing_on = focus_dev.as_ref().filter(|d| !d.apo && d.active).map(|d| (d.id.clone(), d.label()));
@@ -183,8 +314,11 @@ impl App {
             (Some(_), true, Some((id, dev))) => list.push(Banner::InstallOn(id, dev)),
             _ => {}
         }
-        // Active rules that touch what's shown.
-        for r in self.st.rules.iter().filter(|r| self.active_rules.contains(&r.id)) {
+        if let Some(d) = focus_dev.as_ref().filter(|d| mic && self.enh_blocked.contains(&d.id)) {
+            list.push(Banner::Enhancement(d.id.clone(), d.label()));
+        }
+        // Active rules that touch what's shown (rules only ever act on outputs).
+        for r in self.st.rules.iter().filter(|r| !mic && self.active_rules.contains(&r.id)) {
             let touches = match &r.action {
                 Action::UseProfile { target, .. } | Action::Strength { target, .. } => {
                     *target == self.target || (*target == Target::Global && !self.st.owns_chain(&self.target))
@@ -200,7 +334,15 @@ impl App {
         {
             list.push(Banner::Following(id.clone()));
         }
-        if let Some(d) = &focus_dev
+        if let Some(d) = focus_dev.as_ref().filter(|_| mic) {
+            if let Some(m) = self.mlib.suggestions.get(&d.id) {
+                let has = self.st.chain(&self.target).correction.is_some();
+                let dismissed = self.st.mic(&d.id).and_then(|x| x.dismissed_suggestion.clone()) == Some(m.key());
+                if !has && !dismissed {
+                    list.push(Banner::SuggestMic(d.id.clone(), m.clone()));
+                }
+            }
+        } else if let Some(d) = &focus_dev
             && let Some(e) = self.aeq.suggestions.get(&d.id)
         {
             let t = Target::Device(d.id.clone());
@@ -247,7 +389,11 @@ impl App {
                     }
                 }
                 Banner::InstallOn(id, name) => {
-                    let msg = format!("EQ isn't enabled on {name} yet, so you won't hear it there.");
+                    let msg = if mic {
+                        format!("EQ isn't enabled on {name} yet, so it isn't shaping your voice.")
+                    } else {
+                        format!("EQ isn't enabled on {name} yet, so you won't hear it there.")
+                    };
                     match banner(ui, WARN, &msg, &["Enable EQ here", "Choose devices…"]) {
                         Some(0) => {
                             let ctx = ui.ctx().clone();
@@ -312,6 +458,54 @@ impl App {
                         None => {}
                     }
                 }
+                Banner::Update(r) => {
+                    let msg = format!(
+                        "equinox {} is available (you have {}). Updating takes a few seconds and keeps your settings.",
+                        r.version,
+                        equinox::update::current_version()
+                    );
+                    match banner(ui, self.accent, &msg, &["Update now", "Later"]) {
+                        Some(0) => {
+                            let ctx = ui.ctx().clone();
+                            self.install_update(&ctx);
+                        }
+                        Some(_) => self.update_snoozed = true,
+                        None => {}
+                    }
+                }
+                Banner::UpdateProgress(version, p) => {
+                    let msg = format!(
+                        "Downloading equinox {version}… {:.0}%  ·  it restarts by itself when done.",
+                        p * 100.0
+                    );
+                    banner(ui, self.accent, &msg, &[]);
+                }
+                Banner::Enhancement(id, name) => {
+                    let pack = equinox::enhance::pack_name(&id, true);
+                    let msg = format!(
+                        "{pack} is running on {name} instead of the EQ (Windows uses one or the other), so the EQ isn't shaping your voice."
+                    );
+                    if banner(ui, WARN, &msg, &["Turn it off"]) == Some(0) {
+                        let ctx = ui.ctx().clone();
+                        self.run_repair(&ctx, vec![(id, name)]);
+                    }
+                }
+                Banner::SuggestMic(dev, m) => {
+                    let name = self.target_name(&Target::Mic(dev.clone()));
+                    let msg = format!(
+                        "🎤 {name} looks like the {}. Apply its correction from the mic library to even out the microphone's own colouring?",
+                        m.name
+                    );
+                    match banner(ui, VIOLET, &msg, &["Apply", "Not now"]) {
+                        Some(0) => {
+                            self.st.mic_mut(&dev, &name).chain.correction = Some(m.correction());
+                            self.st.mic_bypass = false;
+                            self.notify(format!("{} correction applied", m.name), false);
+                        }
+                        Some(_) => self.st.mic_mut(&dev, &name).dismissed_suggestion = Some(m.key()),
+                        None => {}
+                    }
+                }
             }
             ui.add_space(6.0);
         }
@@ -349,6 +543,7 @@ impl App {
     }
 
     fn profile_bar(&mut self, ui: &mut Ui, pid: Option<u64>) {
+        let mic = self.target.is_mic();
         let name = pid
             .and_then(|id| self.st.profile(id))
             .map(|p| p.name.clone())
@@ -379,7 +574,7 @@ impl App {
             .width(190.0)
             .height(420.0)
             .show_ui(ui, |ui| {
-                let list: Vec<(u64, String)> = self.st.profiles.iter().map(|p| (p.id, p.name.clone())).collect();
+                let list: Vec<(u64, String)> = self.st.profiles_for(mic).map(|p| (p.id, p.name.clone())).collect();
                 for (id, n) in list {
                     if ui.selectable_label(pid == Some(id), n).clicked() {
                         self.st.chain_mut(&self.target).profile = Some(id);
@@ -392,12 +587,13 @@ impl App {
             |ui: &mut Ui, label: &str, tip: &str| flat(ui, RichText::new(label).size(12.5).color(DIM)).on_hover_text(tip).clicked();
         if icon(ui, "+", "New flat profile") {
             let id = self.st.new_id();
-            let n = self.st.unique_name("My sound");
+            let n = self.st.unique_name(if mic { "My voice" } else { "My sound" });
             self.st.profiles.push(Profile {
                 id,
                 name: n.clone(),
                 tone: Tone::default(),
                 bands: vec![],
+                mic,
             });
             self.st.chain_mut(&self.target).profile = Some(id);
             self.rename = Some(n);
@@ -408,21 +604,22 @@ impl App {
                 name: "Flat".into(),
                 tone: Tone::default(),
                 bands: vec![],
+                mic,
             });
             let id = self.st.new_id();
             let n = self.st.unique_name(&format!("{} copy", src.name));
-            self.st.profiles.push(Profile { id, name: n, ..src });
+            self.st.profiles.push(Profile { id, name: n, mic, ..src });
             self.st.chain_mut(&self.target).profile = Some(id);
         }
         if pid.is_some() && icon(ui, "✎", "Rename") {
             self.rename = Some(name.clone());
         }
         if let Some(id) = pid
-            && self.st.profiles.len() > 1
+            && self.st.profiles_for(mic).count() > 1
             && icon(ui, "🗑", "Delete profile (Ctrl+Z brings it back)")
         {
             self.st.delete_profile(id);
-            let first = self.st.profiles.first().map(|p| p.id);
+            let first = self.st.profiles_for(mic).next().map(|p| p.id);
             self.st.chain_mut(&self.target).profile = first;
             self.notify(format!("Deleted {name}"), false);
         }
@@ -456,7 +653,8 @@ impl App {
                 ui.add_space(2.0);
                 ui.horizontal_wrapped(|ui| {
                     ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
-                    let list: Vec<(u64, String)> = self.st.profiles.iter().map(|p| (p.id, p.name.clone())).collect();
+                    let mic = self.target.is_mic();
+                    let list: Vec<(u64, String)> = self.st.profiles_for(mic).map(|p| (p.id, p.name.clone())).collect();
                     for (id, n) in list {
                         if chip(ui, pid == Some(id), self.accent, &n, None).clicked() {
                             self.st.chain_mut(&self.target).profile = Some(id);
@@ -643,11 +841,14 @@ impl App {
         self.sel_band = None;
     }
 
-    fn headphone_card(&mut self, ui: &mut Ui) {
+    /// Headphone correction (AutoEq) for outputs, microphone correction (the
+    /// mic library) for microphones.
+    fn correction_card(&mut self, ui: &mut Ui) {
+        let mic = self.target.is_mic();
         card().inner_margin(14.0).show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 5.0;
             ui.set_width(ui.available_width());
-            caption(ui, "Headphone correction");
+            caption(ui, if mic { "Microphone correction" } else { "Headphone correction" });
             let corr = self.st.chain(&self.target).correction.clone();
             match corr {
                 Some(c) => {
@@ -658,7 +859,7 @@ impl App {
                                 self.st.chain_mut(&self.target).correction = None;
                             }
                             if flat(ui, RichText::new("Change").size(12.0).color(DIM)).clicked() {
-                                self.open_autoeq();
+                                self.open_library();
                             }
                         });
                     });
@@ -677,7 +878,11 @@ impl App {
                             ui.label(RichText::new("Strength").color(TEXT))
                         });
                         hslider(ui, &mut s, 0.0..=150.0, VIOLET, Some(100.0), false, |v| format!("{v:.0} %"))
-                            .on_hover_text("100% = measured target. Lower keeps some of the headphone's character. Double-click resets.")
+                            .on_hover_text(if mic {
+                                "100% = the full correction. Lower keeps some of the microphone's character. Double-click resets."
+                            } else {
+                                "100% = measured target. Lower keeps some of the headphone's character. Double-click resets."
+                            })
                             .changed()
                     });
                     if changed.inner {
@@ -686,14 +891,18 @@ impl App {
                 }
                 None => {
                     ui.label(
-                        RichText::new("Make your headphones sound neutral with lab measurements from AutoEq: about 9,000 models.")
-                            .color(DIM)
-                            .size(12.5),
+                        RichText::new(if mic {
+                            "Even out your microphone's own colouring, so your voice starts from neutral. Pick your model from the mic library."
+                        } else {
+                            "Make your headphones sound neutral with lab measurements from AutoEq: about 9,000 models."
+                        })
+                        .color(DIM)
+                        .size(12.5),
                     );
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
-                        if primary(ui, self.accent, "Find my headphones").clicked() {
-                            self.open_autoeq();
+                        if primary(ui, self.accent, if mic { "Find my microphone" } else { "Find my headphones" }).clicked() {
+                            self.open_library();
                         }
                         if ghost(ui, "Import…")
                             .on_hover_text("Load a correction file (ParametricEQ.txt, GraphicEQ, CSV)")
@@ -710,10 +919,11 @@ impl App {
     fn output_card(&mut self, ui: &mut Ui) {
         let cv = self.curves();
         let r = &cv.r;
+        let mic = self.target.is_mic();
         card().inner_margin(14.0).show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 5.0;
             ui.set_width(ui.available_width());
-            caption(ui, "Output");
+            caption(ui, if mic { "Input" } else { "Output" });
             let mut auto = self.st.chain(&self.target).auto_preamp;
             ui.horizontal(|ui| {
                 ui.label(RichText::new("Preamp").color(TEXT));
@@ -732,12 +942,14 @@ impl App {
             });
             if !auto {
                 let mut p = self.st.chain(&self.target).preamp;
-                if hslider(ui, &mut p, -24.0..=6.0, self.accent, Some(0.0), true, fmt_db).changed() {
+                // A quiet microphone can use real gain; outputs only ever need a cut.
+                let top = if mic { 24.0 } else { 6.0 };
+                if hslider(ui, &mut p, -24.0..=top, self.accent, Some(0.0), true, fmt_db).changed() {
                     self.st.chain_mut(&self.target).preamp = (p * 10.0).round() / 10.0;
                 }
             }
             let margin = r.clip_margin();
-            let (c, t) = if self.st.bypass {
+            let (c, t) = if self.st.bypassed(&self.target) {
                 (DIM, "Bypassed".to_string())
             } else if margin > 0.05 {
                 (BAD, format!("Can clip by {}: lower the preamp or turn on Auto", fmt_db(margin)))
@@ -750,6 +962,23 @@ impl App {
                 ui.label(RichText::new(t).size(11.5).color(DIM));
             });
             ui.add_space(2.0);
+            if mic {
+                self.mic_check_row(ui);
+                // Microphones are one channel; in place of balance, how loud you hear yourself.
+                let mut v = self.st.settings.monitor_volume * 100.0;
+                let changed = ui.horizontal(|ui| {
+                    ui.allocate_ui_with_layout(vec2(62.0, 26.0), Layout::left_to_right(Align::Center), |ui| {
+                        ui.label(RichText::new("Monitor").color(TEXT))
+                    });
+                    hslider(ui, &mut v, 0.0..=200.0, self.accent, Some(100.0), false, |v| format!("{v:.0} %"))
+                        .on_hover_text("How loud \"Hear yourself\" plays back. It doesn't change what others hear.")
+                        .changed()
+                });
+                if changed.inner {
+                    self.st.settings.monitor_volume = (v / 100.0).clamp(0.0, 2.0);
+                }
+                return;
+            }
             let mut bal = self.st.chain(&self.target).balance;
             let changed = ui.horizontal(|ui| {
                 ui.allocate_ui_with_layout(vec2(62.0, 26.0), Layout::left_to_right(Align::Center), |ui| {
@@ -773,10 +1002,206 @@ impl App {
         });
     }
 
-    fn open_autoeq(&mut self) {
+    /// "Check it works": measures the microphone and says whether the EQ is in its signal.
+    fn mic_check_row(&mut self, ui: &mut Ui) {
+        let Target::Mic(id) = self.target.clone() else { return };
+        ui.horizontal(|ui| {
+            if self.mic_checking.as_deref() == Some(id.as_str()) {
+                ui.spinner();
+                ui.label(RichText::new("Listening for 3 seconds…").size(11.5).color(DIM));
+                return;
+            }
+            let verdict = self.mic_verdict.as_ref().filter(|v| v.mic == id).map(|v| v.result.clone());
+            let (dot, text) = match &verdict {
+                Some(Ok(Some(true))) => (GOOD, "Measured: the EQ is in your microphone's signal".to_string()),
+                Some(Ok(Some(false))) => (BAD, "Measured: the EQ is not reaching this microphone".to_string()),
+                Some(Ok(None)) => (DIM, "The EQ is too close to flat to measure".to_string()),
+                Some(Err(e)) => (WARN, e.clone()),
+                None => (DIM, String::new()),
+            };
+            if verdict.is_some() {
+                let (r, _) = ui.allocate_exact_size(vec2(8.0, 8.0), Sense::hover());
+                ui.painter().circle_filled(r.center(), 3.5, dot);
+                ui.add(egui::Label::new(RichText::new(text).size(11.5).color(DIM)).wrap());
+            }
+            let label = if verdict.is_some() {
+                "Check again"
+            } else {
+                "Check that the EQ reaches the microphone"
+            };
+            if flat(ui, RichText::new(label).size(11.5).color(self.accent))
+                .on_hover_text("Records the microphone raw and processed for 3 seconds and compares them. Nothing is saved.")
+                .clicked()
+            {
+                let ctx = ui.ctx().clone();
+                self.check_microphone(&ctx, id.clone());
+            }
+        });
+    }
+
+    /// The browser that fits the target: AutoEq for outputs, the mic library for microphones.
+    fn open_library(&mut self) {
+        if self.target.is_mic() {
+            self.mlib.open = true;
+            self.mlib.focus = true;
+            return;
+        }
         self.aeq.open = true;
         self.aeq.focus = true;
         self.aeq.error = None;
+    }
+
+    pub fn miclib_modal(&mut self, ctx: &egui::Context) {
+        if !self.mlib.open {
+            return;
+        }
+        let Target::Mic(mic_id) = self.target.clone() else {
+            self.mlib.open = false;
+            return;
+        };
+        let modal = egui::Modal::new(egui::Id::unique("miclib"))
+            .frame(
+                egui::Frame::new()
+                    .fill(CARD)
+                    .stroke(Stroke::new(1.0, FAINT))
+                    .corner_radius(16)
+                    .inner_margin(20.0),
+            )
+            .backdrop_color(Color32::from_black_alpha(190));
+        let resp = modal.show(ctx, |ui| {
+            ui.set_width(560.0);
+            ui.horizontal(|ui| {
+                heading(ui, "Find your microphone");
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if flat(ui, RichText::new("✕").color(DIM)).clicked() {
+                        self.mlib.open = false;
+                    }
+                });
+            });
+            ui.label(
+                RichText::new(format!("Correction goes on: {}", self.target_name(&self.target)))
+                    .size(12.0)
+                    .color(DIM),
+            );
+            ui.add_space(8.0);
+            let r = ui.add(
+                egui::TextEdit::singleline(&mut self.mlib.query)
+                    .hint_text("Model, e.g. SM7B, Yeti, AT2020, QuadCast…")
+                    .desired_width(f32::INFINITY)
+                    .font(egui::FontId::proportional(15.0))
+                    .margin(vec2(12.0, 9.0)),
+            );
+            if self.mlib.focus {
+                r.request_focus();
+                self.mlib.focus = false;
+            }
+            ui.add_space(6.0);
+            let lib = self.mlib.lib.clone();
+            let q = self.mlib.query.trim().to_string();
+            let mut results: Vec<&equinox::miclib::Mic> = equinox::miclib::search(&lib, &q, 400);
+            // With no query, the model recognised from this microphone's name leads the list.
+            let recognised = self.mlib.suggestions.get(&mic_id).map(|m| m.name.clone()).filter(|_| q.is_empty());
+            if let Some(name) = &recognised
+                && let Some(i) = results.iter().position(|m| &m.name == name)
+            {
+                let m = results.remove(i);
+                results.insert(0, m);
+            }
+            caption(
+                ui,
+                &if q.is_empty() {
+                    format!("All {} microphones", results.len())
+                } else {
+                    format!("{} match{}", results.len(), if results.len() == 1 { "" } else { "es" })
+                },
+            );
+            let row_h = 40.0;
+            let mut pick = None;
+            egui::ScrollArea::vertical()
+                .max_height(360.0)
+                .auto_shrink([false, true])
+                .show_rows(ui, row_h, results.len(), |ui, range| {
+                    for i in range {
+                        let m = results[i];
+                        let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), row_h - 4.0), Sense::click());
+                        if resp.hovered() {
+                            ui.painter().rect_filled(rect, 8.0, RAISED);
+                        }
+                        ui.painter().text(
+                            rect.left_center() + vec2(12.0, 0.0),
+                            egui::Align2::LEFT_CENTER,
+                            &m.name,
+                            egui::FontId::proportional(14.0),
+                            if m.generic { TEXT } else { WHITE },
+                        );
+                        let lead = i == 0 && (recognised.is_some() || !q.is_empty());
+                        let tag = match (lead, recognised.is_some()) {
+                            (true, true) => "your microphone · ",
+                            (true, false) => "best match · ",
+                            _ => "",
+                        };
+                        ui.painter().text(
+                            rect.right_center() - vec2(12.0, 0.0),
+                            egui::Align2::RIGHT_CENTER,
+                            format!("{tag}{}", m.kind),
+                            egui::FontId::proportional(11.5),
+                            if lead { self.accent } else { DIM },
+                        );
+                        let resp = if m.note.is_empty() { resp } else { resp.on_hover_text(&m.note) };
+                        if resp.clicked() {
+                            pick = Some(m.clone());
+                        }
+                    }
+                });
+            if results.is_empty() {
+                ui.label(
+                    RichText::new("Not in the library yet. Try one of the generic starting points (search \"generic\"), or import a file.")
+                        .size(12.0)
+                        .color(DIM),
+                );
+            }
+            if ui.input(|i| i.key_pressed(egui::Key::Enter))
+                && !q.is_empty()
+                && let Some(m) = results.first()
+            {
+                pick = Some((*m).clone());
+            }
+            if let Some(m) = pick {
+                let name = self.target_name(&self.target);
+                self.st.mic_mut(&mic_id, &name).chain.correction = Some(m.correction());
+                self.st.mic_bypass = false;
+                self.mlib.open = false;
+                self.notify(format!("{} correction applied", m.name), false);
+            }
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new("Unlike headphones, nobody publishes lab measurements for microphones, so these are approximated from each maker's published response chart. Treat them as a starting point and set Strength by ear.")
+                    .size(11.0)
+                    .color(DIM),
+            );
+            ui.horizontal(|ui| {
+                let state = if self.mlib.checking {
+                    "checking for updates…".to_string()
+                } else if self.mlib.offline {
+                    format!("list from {} (offline)", lib.updated)
+                } else {
+                    format!("list updated {}", lib.updated)
+                };
+                ui.label(
+                    RichText::new(format!("{} microphones · equinox mic library · {state}", lib.mics.len()))
+                        .size(11.0)
+                        .color(DIM),
+                );
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if flat(ui, RichText::new("Refresh").size(11.0).color(DIM)).clicked() && !self.mlib.checking {
+                        self.load_miclib(ctx);
+                    }
+                });
+            });
+        });
+        if resp.should_close() {
+            self.mlib.open = false;
+        }
     }
 
     pub fn autoeq_modal(&mut self, ctx: &egui::Context) {
@@ -825,7 +1250,7 @@ impl App {
                     ui.label(RichText::new(format!("Couldn't load the AutoEq list: {e}")).color(BAD));
                     if ghost(ui, "Retry").clicked() {
                         self.aeq.error = None;
-                        self.load_index(ctx, true);
+                        self.load_index(ctx);
                     }
                 } else {
                     ui.horizontal(|ui| {
@@ -916,21 +1341,25 @@ impl App {
                 let age = equinox::autoeq::index_age().map(|a| a.as_secs() / 86400);
                 ui.label(
                     RichText::new(format!(
-                        "{} profiles from AutoEq by Jaakko Pasanen · updated {}",
+                        "{} profiles from AutoEq by Jaakko Pasanen · {}",
                         idx.len(),
-                        match age {
-                            Some(0) | None => "today".to_string(),
-                            Some(1) => "yesterday".to_string(),
-                            Some(d) => format!("{d} days ago"),
+                        if self.aeq.checking {
+                            "checking for updates…".to_string()
+                        } else {
+                            // Checked at every start; older means the last check couldn't reach the server.
+                            match age {
+                                Some(0) | None => "checked today".to_string(),
+                                Some(1) => "last checked yesterday (offline)".to_string(),
+                                Some(d) => format!("last checked {d} days ago (offline)"),
+                            }
                         }
                     ))
                     .size(11.0)
                     .color(DIM),
                 );
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if flat(ui, RichText::new("Refresh").size(11.0).color(DIM)).clicked() {
-                        self.aeq.index = None;
-                        self.load_index(ctx, true);
+                    if flat(ui, RichText::new("Refresh").size(11.0).color(DIM)).clicked() && !self.aeq.checking {
+                        self.load_index(ctx);
                     }
                 });
             });
@@ -962,6 +1391,7 @@ impl App {
             .unwrap_or("Imported")
             .replace(" ParametricEQ", "")
             .replace(" GraphicEQ", "");
+        let mic = self.target.is_mic();
         if as_correction || !parsed.graphic.is_empty() {
             self.st.chain_mut(&self.target).correction = Some(Correction {
                 name: stem.clone(),
@@ -969,7 +1399,10 @@ impl App {
                 filters: parsed.bands,
                 graphic: parsed.graphic,
             });
-            self.notify(format!("Loaded {stem} as headphone correction"), false);
+            self.notify(
+                format!("Loaded {stem} as {} correction", if mic { "microphone" } else { "headphone" }),
+                false,
+            );
         } else {
             let id = self.st.new_id();
             let name = self.st.unique_name(&stem);
@@ -979,6 +1412,7 @@ impl App {
                 name: name.clone(),
                 tone: Tone::default(),
                 bands: parsed.bands,
+                mic,
             });
             self.st.chain_mut(&self.target).profile = Some(id);
             self.st.settings.advanced = true;

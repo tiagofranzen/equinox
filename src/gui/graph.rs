@@ -264,7 +264,8 @@ impl App {
         }
         let tp = to_pts(total);
         fill_to(&clip, &tp, zero_y, accent.gamma_multiply(0.22), accent.gamma_multiply(0.0));
-        let dim = if self.st.bypass { 0.35 } else { 1.0 };
+        let bypassed = self.st.bypassed(&self.target);
+        let dim = if bypassed { 0.35 } else { 1.0 };
         clip.add(egui::Shape::line(tp.clone(), Stroke::new(6.0, accent.gamma_multiply(0.12 * dim))));
         clip.add(egui::Shape::line(tp, Stroke::new(2.4, accent.gamma_multiply(dim))));
 
@@ -356,7 +357,7 @@ impl App {
         // Arrow keys nudge the selected band.
         if let (Some(i), Some(pid)) = (self.sel_band, pid)
             && !ui.ctx().egui_wants_keyboard_input()
-            && self.page == super::Page::Eq
+            && matches!(self.page, super::Page::Eq | super::Page::Mic)
         {
             let (l, r_, u, d, fine) = ui.input(|i| {
                 (
@@ -453,7 +454,7 @@ impl App {
                 TEXT,
             );
         } else {
-            let label = if self.st.bypass {
+            let label = if bypassed {
                 "bypassed".to_string()
             } else {
                 format!("preamp {}", fmt_db(r.preamp))
@@ -475,14 +476,15 @@ impl App {
             x = g.right() + 16.0;
         };
         legend(accent, "Response");
+        let mic = self.target.is_mic();
         if has_corr {
-            legend(VIOLET, "Headphone correction");
+            legend(VIOLET, if mic { "Microphone correction" } else { "Headphone correction" });
             if !r.profile.is_empty() {
-                legend(Color32::from_gray(200), "Your sound");
+                legend(Color32::from_gray(200), if mic { "Your voice shaping" } else { "Your sound" });
             }
         }
         if !self.spectrum.is_empty() {
-            legend(Color32::from_gray(110), "Playing now");
+            legend(Color32::from_gray(110), if mic { "Your microphone now" } else { "Playing now" });
         }
 
         if bands_now.is_empty() && r.profile.is_empty() && !has_corr {
