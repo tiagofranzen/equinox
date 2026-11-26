@@ -63,11 +63,19 @@ pub fn selected(guid: &str, capture: bool) -> Option<String> {
         .ok()
 }
 
+/// Equinox's own effect pack is the selected enhancement.
+pub fn equinox_selected(guid: &str, capture: bool) -> bool {
+    selected(guid, capture).is_some_and(|s| s.eq_ignore_ascii_case(crate::effectpack::PACK))
+}
+
 /// A Windows effect pack is running in place of the endpoint's own effects,
 /// so Equalizer APO is not being loaded for it. With a pack attached and
-/// nothing chosen yet, Windows uses the pack.
+/// nothing chosen yet, Windows uses the pack. Equinox's pack runs the EQ, so
+/// it never counts.
 pub fn overridden(guid: &str, capture: bool) -> bool {
-    effect_pack(guid, capture).is_some() && !selected(guid, capture).is_some_and(|s| s.eq_ignore_ascii_case(DEVICE_EFFECTS_ID))
+    effect_pack(guid, capture).is_some()
+        && !selected(guid, capture)
+            .is_some_and(|s| s.eq_ignore_ascii_case(DEVICE_EFFECTS_ID) || s.eq_ignore_ascii_case(crate::effectpack::PACK))
 }
 
 /// A name for the pack that is in the way, for messages.
@@ -151,6 +159,30 @@ pub fn use_device_effects(guid: &str, capture: bool) -> Result<(), String> {
     select(guid, capture, DEVICE_EFFECTS, [0, 0, 1])
 }
 
+/// Select "Equinox" (equinox's effect pack): only the EQ runs on the
+/// microphone, replacing Voice Clarity and the device's own effects. Windows
+/// stores the flags 1, 0, 1 next to an effect pack. Like
+/// [`use_device_effects`], it takes hold after [`reload`].
+pub fn use_equinox(guid: &str, capture: bool) -> Result<(), String> {
+    let id = GUID::try_from(crate::effectpack::PACK.trim_matches(['{', '}'])).map_err(|e| e.message())?;
+    select(guid, capture, id, [1, 0, 1])
+}
+
+/// The best way to get the EQ onto a microphone: "Equinox" when its effect
+/// pack is installed, else the device's own effects (where Equalizer APO is).
+/// Reloads the endpoint, so the choice is in effect on return. Returns
+/// whether "Equinox" was picked.
+pub fn use_best(guid: &str, capture: bool) -> Result<bool, String> {
+    let equinox = crate::effectpack::installed();
+    if equinox {
+        use_equinox(guid, capture)?;
+    } else {
+        use_device_effects(guid, capture)?;
+    }
+    reload(guid, capture)?;
+    Ok(equinox)
+}
+
 /// Make Windows rebuild an endpoint's effect chain now, by switching the
 /// endpoint off and on again (what "Disable" and "Enable" do in Sound
 /// settings). Apps using it see it vanish for a moment and reconnect; if it
@@ -220,14 +252,13 @@ fn select(guid: &str, capture: bool, enhancement: GUID, flags: [u32; 3]) -> Resu
     set(&config, &id, 2, &text)
 }
 
-/// When a Windows effect pack is in the way: select the endpoint's own effects
-/// and reload the endpoint so that takes hold. Returns whether anything was changed.
+/// When a Windows effect pack is in the way: select "Equinox" (or, without it,
+/// the endpoint's own effects) and reload the endpoint so that takes hold. Returns whether anything was changed.
 pub fn fix(guid: &str, capture: bool) -> Result<bool, String> {
     if !overridden(guid, capture) {
         return Ok(false);
     }
-    use_device_effects(guid, capture)?;
-    reload(guid, capture)?;
+    use_best(guid, capture)?;
     Ok(true)
 }
 

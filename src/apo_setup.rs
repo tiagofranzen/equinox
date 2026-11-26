@@ -623,6 +623,16 @@ pub fn setup(install_guids: &[String], uninstall_guids: &[String]) -> Report {
         rep.devices.push(r);
     }
 
+    // "Equinox" in the microphone's Audio enhancements box (Windows 11 24H2+).
+    // The audio service restart below makes Windows offer it.
+    let mut pack_error = None;
+    if crate::effectpack::supported()
+        && install_guids.iter().any(|g| load(g).is_ok_and(|d| d.input))
+        && let Err(e) = crate::effectpack::install()
+    {
+        pack_error = Some(e);
+    }
+
     let mut modes: HashMap<String, Mode> = HashMap::new();
     let mut remaining: HashMap<String, Vec<Mode>> = HashMap::new();
     let mut testable = Vec::new();
@@ -731,7 +741,71 @@ pub fn setup(install_guids: &[String], uninstall_guids: &[String]) -> Report {
             break;
         }
     }
+
+    // Equalizer APO is confirmed through the device's own effects; now hand
+    // microphones to "Equinox", which runs only the EQ.
+    for r in rep.devices.iter_mut().filter(|r| r.installed && install_guids.contains(&r.guid)) {
+        if !load(&r.guid).is_ok_and(|d| d.input && d.active) {
+            continue;
+        }
+        if let Some(e) = &pack_error {
+            r.note = join(&r.note, &format!("\"Equinox\" couldn't be added to Sound settings: {e}"));
+            continue;
+        }
+        if !crate::enhance::equinox_selected(&r.guid, true) {
+            r.note = match crate::enhance::use_best(&r.guid, true) {
+                // "Equinox" runs Equalizer APO's post-mix APO: make sure it did.
+                Ok(true) if loaded_stages(&r.guid, true).1 => {
+                    join(&r.note, "\"Equinox\" is now its audio enhancement, so only the EQ runs on it")
+                }
+                Ok(true) => {
+                    let back = crate::enhance::use_device_effects(&r.guid, true).and_then(|_| crate::enhance::reload(&r.guid, true));
+                    join(
+                        &r.note,
+                        match back {
+                            Ok(()) => "Windows didn't run \"Equinox\" on it, so the EQ stays with its own effects",
+                            Err(_) => "Windows didn't run \"Equinox\" on it; pick Device Default Effects in Sound settings",
+                        },
+                    )
+                }
+                Ok(false) => r.note.clone(),
+                Err(e) => join(&r.note, &format!("couldn't select \"Equinox\" for it: {e}")),
+            };
+        }
+    }
     rep
+}
+
+fn join(a: &str, b: &str) -> String {
+    if a.is_empty() { b.to_string() } else { format!("{a}; {b}") }
+}
+
+/// Which of Equalizer APO's APOs load on a device right now: (pre-mix,
+/// post-mix). "Equinox" runs the post-mix one; the device's own effects run
+/// the pre-mix one on microphones. Needs admin (the test pipe's registry value).
+pub fn loaded_stages(guid: &str, input: bool) -> (bool, bool) {
+    let guid = guid.to_ascii_lowercase();
+    let rx = pipe_server();
+    let app = hklm().open_subkey_with_flags(APP, KEY_READ | KEY_WRITE);
+    if let Ok(k) = &app {
+        let _ = k.set_value("DeviceTestPipeName", &PIPE);
+    }
+    std::thread::sleep(Duration::from_millis(100));
+    poke(&guid, input);
+    let (mut pre, mut post) = (false, false);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while let Ok(m) = rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&m) else { continue };
+        if v["deviceGuid"].as_str().unwrap_or("").to_ascii_lowercase() == guid && v["phase"] == "Initialize" {
+            pre |= v["stage"] == "PreMix";
+            post |= v["stage"] == "PostMix";
+        }
+    }
+    stop_pipe_server();
+    if let Ok(k) = &app {
+        let _ = k.delete_value("DeviceTestPipeName");
+    }
+    (pre, post)
 }
 
 /// Official Equalizer APO 1.4.2 installers and their SHA-256 (matching SourceForge's published MD5/SHA-1).

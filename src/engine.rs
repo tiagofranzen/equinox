@@ -220,7 +220,10 @@ pub fn apply(state: &State, devices: &[AudioDevice], ctx: &Context) -> Report {
     };
     rep.hooked = a.hooked();
     match a.write(&render(&eff, devices)) {
-        Ok(w) => rep.written = w,
+        Ok(w) => {
+            rep.written = w;
+            crate::effectpack::sync_name(&eff);
+        }
         Err(e) => rep.error = Some(format!("can't write {}: {e}", a.our_file().display())),
     }
     rep.apo = Some(a);

@@ -1678,7 +1678,8 @@ fn ascii_curve(r: &Resolved) -> String {
         grid[y][x] = '●';
         // Fill toward zero for a readable shape.
         let (a, b) = if y < zero { (y + 1, zero) } else { (zero + 1, y) };
-        for line in &mut grid[a..b] {
+        // A point on the zero line has nothing to fill (and `a` is past `b`).
+        for line in grid.get_mut(a..b).into_iter().flatten() {
             if line[x] == ' ' {
                 line[x] = '│';
             }

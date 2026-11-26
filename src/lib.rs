@@ -7,6 +7,7 @@ pub mod apo_setup;
 pub mod autoeq;
 pub mod devices;
 pub mod dsp;
+pub mod effectpack;
 pub mod engine;
 pub mod enhance;
 pub mod eqtext;
