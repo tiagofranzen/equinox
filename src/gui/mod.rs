@@ -7,6 +7,7 @@ mod devices_ui;
 mod eq;
 mod graph;
 mod settings;
+mod setups;
 pub mod theme;
 
 use std::collections::HashMap;
@@ -152,6 +153,8 @@ pub struct App {
     spec_time: Instant,
     pub freqs: Vec<f32>,
     pub rename: Option<String>,
+    /// Setup being renamed in the side bar: (id, text).
+    pub setup_rename: Option<(u64, String)>,
     pub autostart: bool,
     pub agent: bool,
     pub accent: Color32,
@@ -268,6 +271,7 @@ impl App {
             spec_time: Instant::now(),
             freqs: equinox::dsp::log_freqs(360, equinox::dsp::F_MIN, equinox::dsp::F_MAX),
             rename: None,
+            setup_rename: None,
             autostart: sys::autostart_enabled(),
             agent: sys::agent_running(),
             accent,
@@ -1145,6 +1149,13 @@ impl eframe::App for App {
             .frame(egui::Frame::new().fill(BG).stroke(Stroke::new(1.0, LINE)))
             .show_separator_line(false)
             .show(ui, |ui| self.status_bar(ui));
+        if self.page != Page::Mic {
+            egui::Panel::left("setups")
+                .exact_size(210.0)
+                .frame(egui::Frame::new().fill(BG).stroke(Stroke::new(1.0, LINE)))
+                .show_separator_line(false)
+                .show(ui, |ui| self.setups_panel(ui));
+        }
         egui::CentralPanel::no_frame().show(ui, |ui| {
             egui::Frame::new()
                 .fill(BG)

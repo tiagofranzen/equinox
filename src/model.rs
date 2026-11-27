@@ -365,6 +365,16 @@ impl Default for Settings {
     }
 }
 
+/// A named, complete output sound: profile, headphone correction, strength,
+/// preamp and balance. Picking one in the side bar copies it into the global
+/// chain; while it is active, edits are written back to it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Setup {
+    pub id: u64,
+    pub name: String,
+    pub chain: Chain,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct State {
     #[serde(default)]
@@ -387,6 +397,12 @@ pub struct State {
     pub mic_presets: bool,
     #[serde(default)]
     pub profiles: Vec<Profile>,
+    /// Saved whole sounds (one per headphone / speaker set).
+    #[serde(default)]
+    pub setups: Vec<Setup>,
+    /// The setup the global chain currently follows.
+    #[serde(default)]
+    pub active_setup: Option<u64>,
     #[serde(default)]
     pub rules: Vec<Rule>,
     #[serde(default)]
@@ -406,6 +422,8 @@ impl Default for State {
             mic_bypass: false,
             mic_presets: false,
             profiles: Vec::new(),
+            setups: Vec::new(),
+            active_setup: None,
             rules: Vec::new(),
             settings: Settings::default(),
             next_id: 1,
@@ -433,12 +451,58 @@ impl State {
             .iter()
             .map(|p| p.id)
             .chain(self.rules.iter().map(|r| r.id))
+            .chain(self.setups.iter().map(|x| x.id))
             .max()
             .unwrap_or(0);
         self.next_id = self.next_id.max(used + 1);
         let id = self.next_id;
         self.next_id += 1;
         id
+    }
+
+    /// Save the current global chain as a new setup and make it the active one.
+    pub fn add_setup(&mut self, name: &str) -> u64 {
+        let id = self.new_id();
+        let base = if name.trim().is_empty() { "Setup" } else { name.trim() };
+        let mut name = base.to_string();
+        let mut n = 2;
+        while self.setups.iter().any(|x| x.name.eq_ignore_ascii_case(&name)) {
+            name = format!("{base} {n}");
+            n += 1;
+        }
+        let chain = self.global.clone();
+        self.setups.push(Setup { id, name, chain });
+        self.active_setup = Some(id);
+        id
+    }
+
+    /// Switch the global chain to a saved setup.
+    pub fn apply_setup(&mut self, id: u64) {
+        if let Some(x) = self.setups.iter().find(|x| x.id == id) {
+            self.global = x.chain.clone();
+            self.active_setup = Some(id);
+        }
+    }
+
+    pub fn delete_setup(&mut self, id: u64) {
+        self.setups.retain(|x| x.id != id);
+        if self.active_setup == Some(id) {
+            self.active_setup = None;
+        }
+    }
+
+    /// Write edits to the global chain back into the active setup, so a setup
+    /// always holds what it sounds like now.
+    pub fn sync_setup(&mut self) {
+        let Some(id) = self.active_setup else { return };
+        match self.setups.iter_mut().find(|x| x.id == id) {
+            Some(x) => {
+                if x.chain != self.global {
+                    x.chain = self.global.clone();
+                }
+            }
+            None => self.active_setup = None,
+        }
     }
 
     pub fn profile(&self, id: u64) -> Option<&Profile> {
@@ -605,6 +669,9 @@ impl State {
             }
         };
         clear(&mut self.global);
+        for x in &mut self.setups {
+            clear(&mut x.chain);
+        }
         for d in self.devices.iter_mut().chain(&mut self.mics) {
             clear(&mut d.chain);
         }
