@@ -853,7 +853,6 @@ impl App {
             match corr {
                 Some(c) => {
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new(&c.name).size(15.0).family(semibold()).color(WHITE));
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             if flat(ui, RichText::new("Remove").size(12.0).color(DIM)).clicked() {
                                 self.st.chain_mut(&self.target).correction = None;
@@ -861,6 +860,14 @@ impl App {
                             if flat(ui, RichText::new("Change").size(12.0).color(DIM)).clicked() {
                                 self.open_library();
                             }
+                            // Whatever room is left is for the name, cut with an ellipsis.
+                            ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                                ui.add(
+                                    egui::Label::new(RichText::new(&c.name).size(15.0).family(semibold()).color(WHITE))
+                                        .truncate(),
+                                )
+                                .on_hover_text(&c.name);
+                            });
                         });
                     });
                     ui.label(
