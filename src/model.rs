@@ -375,6 +375,16 @@ pub struct Setup {
     pub chain: Chain,
 }
 
+/// File form of a [`Setup`] for import and export.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SetupFile {
+    pub equinox_setup: u32,
+    pub name: String,
+    pub chain: Chain,
+    #[serde(default)]
+    pub profile: Option<Profile>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct State {
     #[serde(default)]
@@ -460,20 +470,74 @@ impl State {
         id
     }
 
-    /// Save the current global chain as a new setup and make it the active one.
-    pub fn add_setup(&mut self, name: &str) -> u64 {
-        let id = self.new_id();
-        let base = if name.trim().is_empty() { "Setup" } else { name.trim() };
+    fn unique_setup_name(&self, base: &str) -> String {
+        let base = if base.trim().is_empty() { "Setup" } else { base.trim() };
         let mut name = base.to_string();
         let mut n = 2;
         while self.setups.iter().any(|x| x.name.eq_ignore_ascii_case(&name)) {
             name = format!("{base} {n}");
             n += 1;
         }
+        name
+    }
+
+    /// Save the current global chain as a new setup and make it the active one.
+    pub fn add_setup(&mut self, name: &str) -> u64 {
+        let id = self.new_id();
+        let name = self.unique_setup_name(name);
         let chain = self.global.clone();
         self.setups.push(Setup { id, name, chain });
         self.active_setup = Some(id);
         id
+    }
+
+    /// Copy a saved setup, including its own copy of the profile so the two
+    /// can be edited apart, and switch to the copy.
+    pub fn duplicate_setup(&mut self, id: u64) -> Option<u64> {
+        let src = self.setups.iter().find(|x| x.id == id)?.clone();
+        let mut chain = src.chain;
+        if let Some(p) = chain.profile.and_then(|p| self.profile(p)).cloned() {
+            let pid = self.new_id();
+            let name = self.unique_name(&format!("{} copy", p.name));
+            self.profiles.push(Profile { id: pid, name, ..p });
+            chain.profile = Some(pid);
+        }
+        let nid = self.new_id();
+        let name = self.unique_setup_name(&format!("{} copy", src.name));
+        self.setups.push(Setup { id: nid, name, chain });
+        self.apply_setup(nid);
+        Some(nid)
+    }
+
+    /// A setup as a JSON file that carries its profile, so it works anywhere.
+    pub fn export_setup(&self, id: u64) -> Option<String> {
+        let x = self.setups.iter().find(|x| x.id == id)?;
+        let profile = x.chain.profile.and_then(|p| self.profile(p)).cloned();
+        let file = SetupFile {
+            equinox_setup: 1,
+            name: x.name.clone(),
+            chain: x.chain.clone(),
+            profile,
+        };
+        serde_json::to_string_pretty(&file).ok()
+    }
+
+    /// Add a setup from [`export_setup`](Self::export_setup) output and switch to it.
+    pub fn import_setup(&mut self, text: &str) -> Result<u64, String> {
+        let f: SetupFile = serde_json::from_str(text).map_err(|_| "that isn't an equinox setup file".to_string())?;
+        let mut chain = f.chain;
+        chain.profile = None;
+        if let Some(p) = f.profile {
+            let pid = self.new_id();
+            let name = self.unique_name(&p.name);
+            self.profiles.push(Profile { id: pid, name, mic: false, ..p });
+            chain.profile = Some(pid);
+        }
+        let id = self.new_id();
+        let name = self.unique_setup_name(&f.name);
+        self.setups.push(Setup { id, name, chain });
+        self.apply_setup(id);
+        Ok(id)
     }
 
     /// Switch the global chain to a saved setup.
